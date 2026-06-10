@@ -1,0 +1,49 @@
+﻿{
+  "defaults": {
+    "model": "MiniMax-Hailuo-2.3",
+    "duration": 6,
+    "resolution": "768P",
+    "prompt_optimizer": true
+  },
+  "max_prompt_length": 2000,
+  "camera_moves": [
+    "固定",
+    "推进",
+    "拉远",
+    "左摇",
+    "右摇",
+    "上升",
+    "下降",
+    "跟随"
+  ],
+  "compatibility": {
+    "MiniMax-Hailuo-2.3": {
+      "6": [
+        "768P",
+        "1080P"
+      ],
+      "10": [
+        "768P"
+      ]
+    },
+    "MiniMax-Hailuo-02": {
+      "6": [
+        "768P",
+        "1080P"
+      ],
+      "10": [
+        "768P"
+      ]
+    },
+    "T2V-01-Director": {
+      "6": [
+        "720P"
+      ]
+    },
+    "T2V-01": {
+      "6": [
+        "720P"
+      ]
+    }
+  }
+}

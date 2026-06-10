@@ -86,10 +86,10 @@ async function getTaskByFileId(db, fileId) {
   return db.get('SELECT * FROM tasks WHERE file_id = ?', [fileId]);
 }
 
-async function getRecentTasks(db, limit = 50) {
+async function getRecentTasks(db, limit = 50, offset = 0) {
   return db.all(
-    'SELECT * FROM tasks ORDER BY datetime(updated_at) DESC LIMIT ?',
-    [limit]
+    'SELECT * FROM tasks ORDER BY datetime(updated_at) DESC LIMIT ? OFFSET ?',
+    [limit, offset]
   );
 }
 

@@ -1,4 +1,4 @@
-# minimax-video-studio
+﻿# minimax-video-studio
 
 MiniMax Token Plan text-to-video studio MVP (non-official).
 
@@ -6,39 +6,44 @@ This repository is an open-source starter for cloning and local development. It 
 
 > You need your own MiniMax Token Plan API Key to run real generation.
 
+Current status:
+- `v0.1.0-alpha` has been published.
+- Phase C.1 real smoke test is verified once.
+- Default smoke checks are non-consuming (dry run).
+
 ## Features
 
 - Text-to-video task creation through backend API
 - Task status polling every 10 seconds
-- Task history listing
-- Video playback + download after completion
+- Task history listing and detail view
+- Task compatibility validation before submit
+- Video playback + download link when available
 - Simple page passcode protection (`SITE_PASSCODE`)
 - SQLite task storage
 - Offline-friendly local setup
 
-## Function scope (Phase A + Phase B)
+## Function scope
 
-Phase C is focused on hardening; no feature expansion:
+Current MVP scope remains text-to-video only:
 
-- Text-to-video only
-- No image-to-video
-- No first/last frame conditioning
-- No subject reference video
+- ✅ Text-to-video
+- ❌ Image-to-video
+- ❌ First/last frame conditioning
+- ❌ Subject reference video
 
 ## Project structure
 
 - `server/` - Express backend, MiniMax adapter, SQLite DB
 - `web/` - Vite + React frontend
-- `scripts/` - smoke test scripts
+- `scripts/` - smoke and local import scripts
 - `docs/` - deployment and phase reports
 - Root configs: `.env.example`, `.nvmrc`, `package.json`
 
 ## Local development (multi-machine flow)
 
 ```bash
+cd D:/Codex/minimax-video-studio
 git clone <your-repo-url>
-cd minimax-video-studio
-nvm use   # or install the version in .nvmrc
 npm install
 cp .env.example .env
 ```
@@ -57,6 +62,13 @@ npm run dev
 - Frontend: <http://127.0.0.1:8789>
 - Health check: <http://127.0.0.1:8789/api/health>
 
+### Multi-machine continuation
+
+- Keep `.env` private on every machine.
+- Run `npm install` to sync dependencies.
+- Run `git pull` then copy `env` values, install, then launch.
+- `data/` and SQLite files are created locally but ignored in repo.
+
 ## Scripts
 
 - `npm run dev`
@@ -65,6 +77,8 @@ npm run dev
 - `npm run build`
 - `npm run start`
 - `npm run smoke:video`
+- `npm run import:local-smoke`
+- `npm run check:open-source`
 
 ## Env vars
 
@@ -86,22 +100,67 @@ npm run dev
 
 ## Smoke test
 
-`npm run smoke:video` validates the API chain and writes:
-
-- `docs/PHASE_A_API_SMOKE_REPORT.md`
-
-Important:
-
-- Real smoke test consumes MiniMax video quota.
-- Default execution does **not** consume quota.
-- Set `CONFIRM_REAL_VIDEO=1` to run real generation:
+- `npm run smoke:video` runs smoke output and does **not** consume quota by default.
+- Set `CONFIRM_REAL_VIDEO=1` for one controlled real run only.
 
 ```bash
-set CONFIRM_REAL_VIDEO=1
+# default dry-run
+a set "CONFIRM_REAL_VIDEO=0";
+npm run smoke:video
+
+# controlled call
+$env:CONFIRM_REAL_VIDEO = "1"
 npm run smoke:video
 ```
 
-(PowerShell: `$env:CONFIRM_REAL_VIDEO = "1"` )
+## Text-to-video parameter compatibility matrix
+
+### Model defaults
+
+- Model: `MiniMax-Hailuo-2.3`
+- Duration: `6`
+- Resolution: `768P`
+- `prompt_optimizer`: `true`
+
+### Supported combinations
+
+- `MiniMax-Hailuo-2.3`
+  - `6s`: `768P`, `1080P`
+  - `10s`: `768P`
+- `MiniMax-Hailuo-02`
+  - `6s`: `768P`, `1080P`
+  - `10s`: `768P`
+- `T2V-01-Director`
+  - `6s`: `720P`
+- `T2V-01`
+  - `6s`: `720P`
+
+### Validation rules
+
+- Illegal model/duration/resolution combos return HTTP 400.
+- Invalid prompt length (`> 2000`) returns HTTP 400.
+- `POST /api/video/create` returns recommendation text on reject.
+- Frontend blocks unsupported combinations before submit.
+
+## Task status
+
+- Preparing: `Preparing`
+- Queueing: `Queueing`
+- Processing: `Processing`
+- Success: `Success`
+- Fail: `Fail`
+
+Frontend displays Chinese descriptions for the same statuses.
+
+## Local smoke import
+
+If a real smoke result exists in `reports/local/phase-c1-real-smoke.local.json`, import it into SQLite:
+
+```bash
+npm run import:local-smoke
+```
+
+This script keeps local records only and does not commit local JSON artifacts.
 
 ## Tencent Cloud deployment guide (generic)
 
@@ -120,16 +179,6 @@ Recommended process:
 3. Push to public GitHub repository
 4. Keep `.env.example` only, not real secrets
 
-## Roadmap
-
-- Add image-to-video
-- Add first-frame / last-frame mode
-- Add subject reference
-- Prompt template library
-- Local gallery enhancements
-- Tencent Cloud domain + HTTPS + reverse proxy in next phase
-- Optional Docker packaging
-
 ## Open-source boundary
 
 - Can publish:
@@ -141,9 +190,20 @@ Recommended process:
   - real API keys
   - real database files
   - logs
-  - any real server IPs/domains from local environment
+  - any local path or IP/domain details from your environment
 
-## Limits
+## Roadmap
+
+- Add image-to-video
+- Add first-frame / last-frame mode
+- Add subject reference
+- Prompt template library
+- Local gallery enhancements
+- Tencent Cloud domain + HTTPS + reverse proxy in next phase
+- Optional Docker packaging
+
+## Current limits
 
 - This is a local MVP for personal usage and multi-machine continuation.
-- It is intentionally minimal and safe by default; do not add unrequested features.
+- It is intentionally minimal and safe by default.
+- `download_url` may expire and refresh logic can be enhanced later.

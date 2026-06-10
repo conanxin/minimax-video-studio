@@ -12,7 +12,9 @@
     "dev:web": "vite --config web/vite.config.js",
     "build": "vite build --config web/vite.config.js",
     "start": "node server/index.js",
-    "smoke:video": "node scripts/smoke-text-to-video.js"
+    "smoke:video": "node scripts/smoke-text-to-video.js",
+    "import:local-smoke": "node scripts/import-local-smoke-to-db.js",
+    "check:open-source": "node scripts/check-open-source.js"
   },
   "dependencies": {
     "axios": "^1.8.4",

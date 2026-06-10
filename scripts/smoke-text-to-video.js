@@ -1,7 +1,18 @@
-const fs = require('fs');
+﻿const fs = require('fs');
 const path = require('path');
 const { config } = require('dotenv');
-const { createTextToVideo, queryVideoTask, retrieveVideoFile } = require('../server/services/minimaxClient');
+const { normalizeMiniMaxStatus } = require('../server/services/taskStore');
+const {
+  createTextToVideo,
+  queryVideoTask,
+  retrieveVideoFile,
+} = require('../server/services/minimaxClient');
+const {
+  upsertTaskByTaskId,
+  updateTaskByTaskId,
+  createTaskRecord,
+  modelConfig,
+} = require('../server/services/taskStore');
 
 config();
 
@@ -36,6 +47,15 @@ function maskId(value) {
 
 function formatDateTime(value) {
   return new Date(value).toLocaleString('en-US');
+}
+
+function normalizeReportStatus(status) {
+  return normalizeMiniMaxStatus(status) || 'Unknown';
+}
+
+function isStatusTerminal(status) {
+  const normalized = normalizeReportStatus(status);
+  return normalized === 'Success' || normalized === 'Fail';
 }
 
 function renderPhaseAReport(context) {
@@ -77,20 +97,13 @@ function renderPhaseAReport(context) {
 `;
 }
 
-async function writePhaseAReport(context) {
-  const content = renderPhaseAReport(context);
-  await fs.promises.mkdir(path.dirname(PHASE_A_REPORT_PATH), { recursive: true });
-  await fs.promises.writeFile(PHASE_A_REPORT_PATH, content, 'utf8');
-  console.log(`Smoke report saved: ${PHASE_A_REPORT_PATH}`);
-}
-
 function renderPhaseC1LocalReport(context) {
   return `# Phase C.1 - Real MiniMax Smoke Test (Local)
 
 ## Execution mode
 - confirm_real_video: ${safeText(process.env.CONFIRM_REAL_VIDEO)}
 - prompt: ${safeText(context.prompt)}
-- requested_prompt: A calm moonlit ocean at night, gentle waves moving slowly, soft cinematic lighting, peaceful atmosphere, slow camera push in, 6 seconds.
+- requested_prompt: ${safeText(context.prompt)}
 
 ## Result
 - created: ${safeText(context.created)}
@@ -117,8 +130,8 @@ function buildPhaseC1PublicReport(context) {
 - Kept sensitive identifiers masked in public artifacts.
 
 ## Why real smoke first
-- Ensure official endpoint adaptation is correct before expanding new rendering features.
-- Confirm request/response behavior and failure reason handling under real quota use.
+- Ensure official endpoint adaptation is correct before expanding new features.
+- Confirm request/response behavior and failure reason handling under real quota usage.
 
 ## Whether real MiniMax call happened
 - ${safeText(context.created) === 'Yes' ? 'Yes' : 'No'}
@@ -128,15 +141,15 @@ function buildPhaseC1PublicReport(context) {
 
 ## Task creation
 - Created: ${safeText(context.created)}
-- task_id: redacted
+- task_id: ${maskId(context.taskId)}
 - creation_status: ${safeText(context.createdStatus)}
 
 ## Task query
 - query_result: ${safeText(context.finalStatus)}
-- file_id: redacted
+- file_id: ${maskId(context.fileId)}
 
 ## Video retrieval
-- download_url: ${context.downloadUrl === 'present' || safeText(context.downloadUrl).startsWith('http') ? 'present' : safeText(context.downloadUrl)}
+- download_url: ${safeText(context.downloadUrl)}
 
 ## Frontend verification
 - task_record_visible: ${safeText(context.frontendVisible)}
@@ -159,8 +172,15 @@ function buildPhaseC1PublicReport(context) {
 - mode: controlled single-run
 
 ## Next suggestions
-- Add one-time manual re-run in separate environment if transient MiniMax errors appear.
+- If needed, run one-time remote status recheck later without creating a new task.
 `;
+}
+
+async function writePhaseAReport(context) {
+  const content = renderPhaseAReport(context);
+  await fs.promises.mkdir(path.dirname(PHASE_A_REPORT_PATH), { recursive: true });
+  await fs.promises.writeFile(PHASE_A_REPORT_PATH, content, 'utf8');
+  console.log(`Smoke report saved: ${PHASE_A_REPORT_PATH}`);
 }
 
 async function writePhaseC1LocalAndConsole(context, publicReportPath) {
@@ -173,6 +193,100 @@ async function writePhaseC1LocalAndConsole(context, publicReportPath) {
   }
   console.log(`Local C1 report saved: ${PHASE_C1_LOCAL_MD}`);
   console.log(`Local C1 JSON saved: ${PHASE_C1_LOCAL_JSON}`);
+}
+
+function buildPayloadFromEnv() {
+  return {
+    model: modelConfig.defaults.model,
+    prompt: 'A calm moonlit ocean at night, gentle waves moving slowly, soft cinematic lighting, peaceful atmosphere, slow camera push in, 6 seconds.',
+    duration: modelConfig.defaults.duration,
+    resolution: modelConfig.defaults.resolution,
+    prompt_optimizer: modelConfig.defaults.prompt_optimizer,
+  };
+}
+
+async function persistSmokeTaskProgress(task) {
+  const status = normalizeReportStatus(task.status);
+  const patch = {
+    status,
+    fail_reason: task.fail_reason || 'No fail reason yet',
+    file_id: task.file_id || null,
+    download_url: task.download_url || null,
+  };
+  return updateTaskByTaskId(task.task_id, patch);
+}
+
+async function runRealSmoke(context) {
+  const payload = buildPayloadFromEnv();
+  const created = await createTextToVideo(payload);
+  if (!created.task_id) {
+    throw new Error('No task_id returned from create API');
+  }
+
+  context.created = 'Yes';
+  context.createdStatus = normalizeReportStatus(created.status);
+  context.taskId = created.task_id;
+
+  let taskRecord = await upsertTaskByTaskId(created.task_id, {
+    prompt: payload.prompt,
+    model: payload.model,
+    duration: payload.duration,
+    resolution: payload.resolution,
+    prompt_optimizer: payload.prompt_optimizer,
+    status: normalizeReportStatus(created.status) || 'Queueing',
+    file_id: created.file_id || null,
+    download_url: created.download_url || null,
+    fail_reason: created.fail_reason || null,
+  });
+
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    const task = await queryVideoTask(created.task_id);
+    taskRecord = await persistSmokeTaskProgress({
+      task_id: created.task_id,
+      status: task.status,
+      fail_reason: task.fail_reason,
+      file_id: task.file_id,
+      download_url: task.download_url,
+    });
+
+    context.finalStatus = normalizeReportStatus(task.status);
+    context.taskId = created.task_id;
+    context.fileId = task.file_id || 'N/A';
+    context.failReason = task.fail_reason || 'N/A';
+
+    if (context.finalStatus === 'Success' && task.file_id) {
+      const file = await retrieveVideoFile(task.file_id);
+      context.fileId = file.file_id || task.file_id || 'N/A';
+      context.downloadUrl = file.download_url ? 'present' : 'absent';
+      await persistSmokeTaskProgress({
+        task_id: created.task_id,
+        status: context.finalStatus,
+        fail_reason: context.failReason,
+        file_id: context.fileId,
+        download_url: file.download_url || task.download_url || null,
+      });
+      break;
+    }
+
+    if (context.finalStatus === 'Fail') {
+      context.downloadUrl = 'absent';
+      break;
+    }
+
+    await sleep(CHECK_INTERVAL_MS);
+    if (i === MAX_ATTEMPTS - 1) {
+      context.finalStatus = 'timed out';
+      context.failReason = 'Polling reached max attempts before completion.';
+      if (taskRecord) {
+        await updateTaskByTaskId(created.task_id, {
+          fail_reason: context.failReason,
+          status: taskRecord.status,
+        });
+      }
+    }
+  }
+
+  return taskRecord;
 }
 
 async function main() {
@@ -189,7 +303,7 @@ async function main() {
     chargeUsed: 'No',
     startedAt: start,
     finishedAt: start,
-    prompt: 'A calm moonlit ocean at night, gentle waves moving slowly, soft cinematic lighting, peaceful atmosphere, slow camera push in, 6 seconds.',
+    prompt: buildPayloadFromEnv().prompt,
     frontendVisible: 'unknown',
     playbackOrLink: 'unknown',
   };
@@ -216,7 +330,10 @@ async function main() {
     report.createdStatus = 'not_created';
     report.finalStatus = 'failed';
     report.finishedAt = new Date().toISOString();
-    await writePhaseC1LocalAndConsole(report, isPhaseC1 ? path.resolve(process.cwd(), 'docs', 'PHASE_C1_REAL_SMOKE_REPORT.md') : null);
+    report.chargeUsed = 'No';
+    await writePhaseC1LocalAndConsole(report, isPhaseC1
+      ? path.resolve(process.cwd(), 'docs', 'PHASE_C1_REAL_SMOKE_REPORT.md')
+      : null);
     await writePhaseAReport(report);
     return;
   }
@@ -225,62 +342,57 @@ async function main() {
   report.requestTaskStarted = 'Yes';
 
   try {
-    const created = await createTextToVideo({
-      model: 'MiniMax-Hailuo-2.3',
-      prompt: report.prompt,
-      duration: 6,
-      resolution: '768P',
-      prompt_optimizer: true,
-    });
-
-    report.created = 'Yes';
-    report.taskId = safeText(created.task_id);
-    report.createdStatus = safeText(created.status);
-    report.requestTaskStarted = 'Yes';
-    console.log(`task_id: ${report.taskId}`);
-    console.log(`status: ${report.createdStatus}`);
-
-    if (!created.task_id) {
-      throw new Error('No task_id returned');
-    }
-
-    for (let i = 0; i < MAX_ATTEMPTS; i++) {
-      const task = await queryVideoTask(created.task_id);
-      report.finalStatus = safeText(task.status);
-      report.taskId = safeText(task.task_id || created.task_id);
-      report.fileId = safeText(task.file_id);
-      report.failReason = safeText(task.fail_reason);
-      console.log(
-        `status: ${task.status}, file_id: ${safeText(task.file_id)}, fail_reason: ${safeText(task.fail_reason)}`
-      );
-
-      if (task.status === 'success') {
-        if (task.file_id) {
-          const file = await retrieveVideoFile(task.file_id);
-          report.fileId = safeText(file.file_id || task.file_id || report.fileId);
-          report.downloadUrl = file.download_url ? 'present' : 'absent';
-        } else {
-          report.downloadUrl = 'absent';
-        }
-        break;
-      }
-      if (task.status === 'fail') {
-        report.downloadUrl = 'absent';
-        break;
-      }
-      await sleep(CHECK_INTERVAL_MS);
+    const taskRecord = await runRealSmoke(report);
+    if (!taskRecord) {
+      await createTaskRecord({
+        task_id: `local-${Date.now()}`,
+        prompt: report.prompt,
+        model: modelConfig.defaults.model,
+        duration: modelConfig.defaults.duration,
+        resolution: modelConfig.defaults.resolution,
+        prompt_optimizer: modelConfig.defaults.prompt_optimizer,
+        status: 'Fail',
+        file_id: null,
+        download_url: null,
+        fail_reason: 'No task record could be created from remote task query.',
+      });
     }
   } catch (error) {
     report.finalStatus = 'failed';
     report.failReason = error.message || 'unknown error';
     console.error(error.message || error);
+
+    if (report.created === 'Yes') {
+      await updateTaskByTaskId(report.taskId, {
+        status: 'Fail',
+        fail_reason: report.failReason,
+      }).catch(() => {});
+    } else {
+      await createTaskRecord({
+        task_id: `local-${Date.now()}`,
+        prompt: report.prompt,
+        model: modelConfig.defaults.model,
+        duration: modelConfig.defaults.duration,
+        resolution: modelConfig.defaults.resolution,
+        prompt_optimizer: modelConfig.defaults.prompt_optimizer,
+        status: 'Fail',
+        file_id: null,
+        download_url: null,
+        fail_reason: report.failReason,
+      }).catch(() => {});
+    }
   } finally {
     report.finishedAt = new Date().toISOString();
-    await writePhaseC1LocalAndConsole(report, isPhaseC1 ? path.resolve(process.cwd(), 'docs', 'PHASE_C1_REAL_SMOKE_REPORT.md') : null);
-    if (!isPhaseC1) {
-      await writePhaseAReport(report);
-    }
+    report.downloadUrl = safeText(report.downloadUrl);
+    await writePhaseC1LocalAndConsole(report, isPhaseC1
+      ? path.resolve(process.cwd(), 'docs', 'PHASE_C1_REAL_SMOKE_REPORT.md')
+      : null);
+    await writePhaseAReport(report);
     console.log(`Final status: ${report.finalStatus}`);
+    console.log('Smoke flow completed.');
+    if (report.taskId !== 'N/A') {
+      console.log(`task record: redacted`);
+    }
   }
 }
 
