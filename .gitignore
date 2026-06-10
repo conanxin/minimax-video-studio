@@ -1,0 +1,11 @@
+node_modules/
+dist/
+logs/
+.env
+.env.local
+data/*.db
+data/*.sqlite
+*.log
+
+pnpm-lock.yaml
+yarn.lock
