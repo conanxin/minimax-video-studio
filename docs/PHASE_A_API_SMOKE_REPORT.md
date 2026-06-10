@@ -1,4 +1,4 @@
-# Phase A - MiniMax API Smoke Test Report
+﻿# Phase A - MiniMax API Smoke Test Report
 
 ## What was verified
 - Read env and confirm MINIMAX_API_KEY exists.
@@ -10,7 +10,7 @@
 - Confirm integration points and error handling before full UI acceptance.
 
 ## Environment variables used
-- MINIMAX_API_KEY: sk-c...0b0Y
+- MINIMAX_API_KEY: masked
 - MINIMAX_API_BASE: https://api.minimaxi.com
 - PORT: 8789
 - DATABASE_PATH: ./data/minimax-video-studio.sqlite
