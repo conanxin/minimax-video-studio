@@ -7,5 +7,9 @@ data/*.db
 data/*.sqlite
 *.log
 
+reports/local/
+*.local.md
+*.local.json
+
 pnpm-lock.yaml
 yarn.lock
