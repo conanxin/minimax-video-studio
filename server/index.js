@@ -20,6 +20,7 @@ const {
   queryVideoTask,
   retrieveVideoFile,
 } = require('./services/minimaxClient');
+const pollingConfig = require('../shared/pollingConfig.json');
 
 config();
 
@@ -44,6 +45,18 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/video/models', (_req, res) => {
   res.json(modelConfig);
+});
+
+app.get('/api/polling/config', (_req, res) => {
+  res.json({
+    initialIntervalMs: pollingConfig.initialIntervalMs,
+    maxIntervalMs: pollingConfig.maxIntervalMs,
+    maxAttempts: pollingConfig.maxAttempts,
+    maxDurationMinutes: pollingConfig.maxDurationMinutes,
+    backoffFactor: pollingConfig.backoffFactor,
+    jitterMs: pollingConfig.jitterMs,
+    source: 'shared/pollingConfig.json',
+  });
 });
 
 function getPasscode(req) {
@@ -203,6 +216,54 @@ app.get('/api/video/file/:fileId', requirePasscode, async (req, res) => {
   });
 });
 
+app.post('/api/video/file/:fileId/refresh', requirePasscode, async (req, res) => {
+  const { fileId } = req.params;
+  const fileIdText = String(fileId || '').trim();
+  if (!fileIdText) {
+    return res.status(400).json({ error: 'fileId is required.' });
+  }
+
+  const task = await getTaskByFileId(fileIdText);
+  if (!task) {
+    return res.status(404).json({
+      error: 'No local task is associated with this file_id. Open the task from history first.',
+    });
+  }
+
+  try {
+    const response = await retrieveVideoFile(fileIdText);
+    const remoteFileId = response?.file_id || fileIdText;
+    const remoteDownloadUrl = response?.download_url || null;
+
+    const patch = { file_id: remoteFileId };
+    if (remoteDownloadUrl) {
+      patch.download_url = remoteDownloadUrl;
+    }
+
+    const updated = await updateTaskByTaskId(task.task_id, patch);
+    const safeUpdated = toSafeTaskPayload(updated);
+
+    return res.json({
+      file_id: safeUpdated.file_id,
+      task_id: safeUpdated.task_id,
+      status: safeUpdated.status,
+      download_url: safeUpdated.download_url,
+      download_url_present: Boolean(safeUpdated.download_url),
+      refreshed_at: safeUpdated.updated_at,
+      message: safeUpdated.download_url
+        ? 'Download link refreshed.'
+        : 'File is reachable but no download_url is available yet.',
+    });
+  } catch (error) {
+    const status = error?.status || 502;
+    return res.status(status >= 400 && status < 600 ? status : 502).json({
+      error: error?.message || 'Failed to refresh download link.',
+      file_id: fileIdText,
+      task_id: task.task_id,
+    });
+  }
+});
+
 app.get('/api/tasks', requirePasscode, async (req, res) => {
   const rawLimit = Number(req.query.limit || 100);
   const rawOffset = Number(req.query.offset || 0);
@@ -228,4 +289,7 @@ app.listen(PORT, () => {
   console.log(`MiniMax studio backend running on :${PORT}`);
   console.log(`SQLite db path: ${process.env.DATABASE_PATH || './data/minimax-video-studio.sqlite'}`);
   console.log(`Health check: http://localhost:${PORT}/api/health`);
+  console.log(
+    `Polling guardrails: maxAttempts=${pollingConfig.maxAttempts}, maxDurationMinutes=${pollingConfig.maxDurationMinutes}, initialIntervalMs=${pollingConfig.initialIntervalMs}, maxIntervalMs=${pollingConfig.maxIntervalMs}`,
+  );
 });

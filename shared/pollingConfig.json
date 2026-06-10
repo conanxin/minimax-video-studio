@@ -1,0 +1,9 @@
+{
+  "initialIntervalMs": 10000,
+  "maxIntervalMs": 30000,
+  "maxAttempts": 60,
+  "maxDurationMinutes": 20,
+  "backoffFactor": 1.5,
+  "jitterMs": 1500,
+  "description": "Shared polling guardrails for both server-side smoke and frontend task status polling. Polling must always stop before maxDurationMinutes is reached. After maxAttempts the UI must fall back to manual refresh from task history."
+}

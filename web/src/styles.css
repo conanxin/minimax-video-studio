@@ -193,6 +193,13 @@ textarea {
   margin-bottom: 12px;
 }
 
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .video-area {
   margin-top: 12px;
 }

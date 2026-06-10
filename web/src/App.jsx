@@ -1,6 +1,13 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
 
-const POLL_INTERVAL_MS = 10_000;
+const FALLBACK_POLLING_CONFIG = {
+  initialIntervalMs: 10_000,
+  maxIntervalMs: 30_000,
+  maxAttempts: 60,
+  maxDurationMinutes: 20,
+  backoffFactor: 1.5,
+  jitterMs: 1500,
+};
 
 const FALLBACK_MODEL_CONFIG = {
   defaults: {
@@ -59,10 +66,14 @@ function isTerminalStatus(status) {
   return normalizeStatus(status) === 'Success' || normalizeStatus(status) === 'Fail';
 }
 
+function shortId(value) {
+  if (!value) return '-';
+  if (value.length <= 16) return value;
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+}
+
 function shortTaskId(taskId) {
-  if (!taskId) return '-';
-  if (taskId.length <= 16) return taskId;
-  return `${taskId.slice(0, 8)}...${taskId.slice(-6)}`;
+  return shortId(taskId);
 }
 
 function escapeRegExp(value) {
@@ -104,8 +115,30 @@ function supportHint(config, model, duration) {
   return `${model} supports: ${parts.join('; ')}`;
 }
 
+function clampNumber(value, fallback, min, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  if (min !== undefined && numeric < min) return min;
+  if (max !== undefined && numeric > max) return max;
+  return numeric;
+}
+
+function pickPollingConfig(remote) {
+  const fallback = FALLBACK_POLLING_CONFIG;
+  if (!remote || typeof remote !== 'object') return fallback;
+  return {
+    initialIntervalMs: clampNumber(remote.initialIntervalMs, fallback.initialIntervalMs, 1000, 5 * 60_000),
+    maxIntervalMs: clampNumber(remote.maxIntervalMs, fallback.maxIntervalMs, 1000, 10 * 60_000),
+    maxAttempts: clampNumber(remote.maxAttempts, fallback.maxAttempts, 1, 1000),
+    maxDurationMinutes: clampNumber(remote.maxDurationMinutes, fallback.maxDurationMinutes, 1, 240),
+    backoffFactor: clampNumber(remote.backoffFactor, fallback.backoffFactor, 1, 5),
+    jitterMs: clampNumber(remote.jitterMs, fallback.jitterMs, 0, 60_000),
+  };
+}
+
 export default function App() {
   const [modelConfig, setModelConfig] = useState(FALLBACK_MODEL_CONFIG);
+  const [pollingConfig, setPollingConfig] = useState(FALLBACK_POLLING_CONFIG);
   const [passcode, setPasscode] = useState('');
   const [prompt, setPrompt] = useState('');
   const [model, setModel] = useState(FALLBACK_MODEL_CONFIG.defaults.model);
@@ -115,10 +148,16 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
+  const [refreshingId, setRefreshingId] = useState('');
   const [currentTask, setCurrentTask] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
   const [tasks, setTasks] = useState([]);
+  const [pollingState, setPollingState] = useState({ active: false, attempt: 0, exhausted: false });
   const pollingTimer = useRef(null);
+  const pollingStartedAt = useRef(null);
+  const pollingAttempt = useRef(0);
+  const pollingTaskId = useRef(null);
 
   const models = useMemo(() => buildModelList(modelConfig), [modelConfig]);
   const durations = useMemo(() => getDurations(modelConfig, model), [modelConfig, model]);
@@ -140,6 +179,18 @@ export default function App() {
       }
     }
     loadConfig();
+  }, []);
+
+  useEffect(() => {
+    async function loadPolling() {
+      try {
+        const cfg = await requestJson('/api/polling/config', { method: 'GET' }, false);
+        setPollingConfig(pickPollingConfig(cfg));
+      } catch {
+        setPollingConfig(FALLBACK_POLLING_CONFIG);
+      }
+    }
+    loadPolling();
   }, []);
 
   useEffect(() => {
@@ -170,7 +221,7 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (pollingTimer.current) {
-        clearInterval(pollingTimer.current);
+        clearTimeout(pollingTimer.current);
       }
     };
   }, []);
@@ -232,41 +283,91 @@ export default function App() {
       setSelectedTask(task);
     }
     if (isTerminalStatus(task.status)) {
-      stopPolling();
+      stopPolling('reached terminal status');
       loadTasks();
     }
   }
 
-  function stopPolling() {
+  function stopPolling(reason) {
     if (pollingTimer.current) {
-      clearInterval(pollingTimer.current);
+      clearTimeout(pollingTimer.current);
       pollingTimer.current = null;
     }
+    pollingStartedAt.current = null;
+    pollingAttempt.current = 0;
+    pollingTaskId.current = null;
+    setPollingState({ active: false, attempt: 0, exhausted: false, reason: reason || null });
+  }
+
+  function scheduleNextPoll(taskId) {
+    if (pollingTaskId.current !== taskId) return;
+    const elapsedMs = Date.now() - (pollingStartedAt.current || Date.now());
+    const maxMs = pollingConfig.maxDurationMinutes * 60_000;
+    if (elapsedMs >= maxMs) {
+      setError(
+        `Polling reached the configured max duration of ${pollingConfig.maxDurationMinutes} minutes. ` +
+          'Please refresh this task from history later.',
+      );
+      stopPolling('reached max duration');
+      return;
+    }
+    if (pollingAttempt.current >= pollingConfig.maxAttempts) {
+      setError(
+        `Polling reached the configured max attempts of ${pollingConfig.maxAttempts}. ` +
+          'Please refresh this task from history later.',
+      );
+      stopPolling('reached max attempts');
+      return;
+    }
+
+    const baseInterval = Math.min(
+      pollingConfig.initialIntervalMs * Math.pow(pollingConfig.backoffFactor, pollingAttempt.current - 1),
+      pollingConfig.maxIntervalMs,
+    );
+    const jitter = pollingConfig.jitterMs > 0 ? Math.floor(Math.random() * pollingConfig.jitterMs) : 0;
+    const nextDelay = Math.max(1000, Math.round(baseInterval + jitter));
+
+    pollingTimer.current = setTimeout(() => {
+      pollTask(taskId);
+    }, nextDelay);
   }
 
   async function pollTask(taskId) {
+    if (pollingTaskId.current !== taskId) return;
     try {
       const remoteTask = await requestJson(`/api/video/task/${encodeURIComponent(taskId)}`);
+      pollingAttempt.current += 1;
+      setPollingState({
+        active: true,
+        attempt: pollingAttempt.current,
+        exhausted: false,
+        taskId,
+      });
       updateCurrentTask(remoteTask);
+      if (!isTerminalStatus(remoteTask.status)) {
+        scheduleNextPoll(taskId);
+      }
     } catch (err) {
       setError(err.message || 'Failed to query task status. Please retry.');
-      stopPolling();
+      stopPolling('query error');
       setLoading(false);
     }
   }
 
   function startPolling(taskId) {
-    stopPolling();
+    stopPolling('restarting');
+    pollingTaskId.current = taskId;
+    pollingStartedAt.current = Date.now();
+    pollingAttempt.current = 0;
+    setPollingState({ active: true, attempt: 0, exhausted: false, taskId });
     pollTask(taskId);
-    pollingTimer.current = setInterval(() => {
-      pollTask(taskId);
-    }, POLL_INTERVAL_MS);
   }
 
   async function onSubmit(e) {
     e.preventDefault();
     setError('');
     setMessage('');
+    setInfo('');
 
     if (!passcode.trim()) {
       setError('Please enter SITE_PASSCODE before submitting.');
@@ -305,7 +406,7 @@ export default function App() {
         ...result,
         status: normalizeStatus(result.status || 'Queueing'),
       };
-      setMessage(`Task submitted. Task ID: ${shortTaskId(safeTask.task_id)}`);
+      setMessage(`Task submitted. Task ID: ${shortTaskId(safeTask.task_id)}. Note: a real submission consumes MiniMax quota.`);
       setCurrentTask(safeTask);
       setSelectedTask(safeTask);
       startPolling(safeTask.task_id);
@@ -320,6 +421,7 @@ export default function App() {
     if (!task?.task_id) return;
     setSelectedTask(task);
     setError('');
+    setInfo('');
 
     if (passcode.trim()) {
       try {
@@ -331,26 +433,71 @@ export default function App() {
     }
   }
 
+  async function refreshTaskStatus(task) {
+    if (!task?.task_id) return;
+    setRefreshingId(task.task_id);
+    setError('');
+    setInfo('');
+    try {
+      const detail = await requestJson(`/api/video/task/${encodeURIComponent(task.task_id)}`);
+      const normalized = { ...detail, status: normalizeStatus(detail.status) };
+      setCurrentTask(normalized);
+      setSelectedTask(normalized);
+      setInfo(`Task ${shortTaskId(task.task_id)} status refreshed.`);
+      loadTasks();
+    } catch (err) {
+      setError(err.message || 'Failed to refresh task status.');
+    } finally {
+      setRefreshingId('');
+    }
+  }
+
   async function refreshDownload(task) {
     if (!task?.file_id) {
       setError('No file_id in this task.');
       return;
     }
 
+    setRefreshingId(task.file_id);
+    setError('');
+    setInfo('');
     try {
-      const response = await requestJson(`/api/video/file/${encodeURIComponent(task.file_id)}`);
+      const response = await requestJson(
+        `/api/video/file/${encodeURIComponent(task.file_id)}/refresh`,
+        { method: 'POST', body: JSON.stringify({}) },
+      );
       const updated = {
         ...task,
         status: normalizeStatus(response.status || task.status),
         file_id: response.file_id,
         download_url: response.download_url,
+        updated_at: response.refreshed_at || task.updated_at,
       };
       setCurrentTask(updated);
       setSelectedTask(updated);
+      setInfo(response.message || 'Download link refreshed.');
       loadTasks();
     } catch (err) {
       setError(err.message || 'Failed to refresh download link.');
+    } finally {
+      setRefreshingId('');
     }
+  }
+
+  function copyParamsToForm(task) {
+    if (!task) return;
+    setModel(task.model || FALLBACK_MODEL_CONFIG.defaults.model);
+    setDuration(Number(task.duration) || FALLBACK_MODEL_CONFIG.defaults.duration);
+    setResolution(task.resolution || FALLBACK_MODEL_CONFIG.defaults.resolution);
+    setPromptOptimizer(task.prompt_optimizer !== false);
+    if (typeof task.prompt === 'string') {
+      setPrompt(task.prompt);
+    }
+    setInfo(
+      'Parameters copied to the create form. Review and submit manually. ' +
+        'A new submission will consume MiniMax quota.',
+    );
+    setError('');
   }
 
   function appendCameraMove(move) {
@@ -369,12 +516,16 @@ export default function App() {
   }
 
   const showLoadingMessage = loading ? 'Submitting...' : 'Submit task';
+  const terminalStatus = selectedTask ? normalizeStatus(selectedTask.status) : null;
+  const hasFileId = Boolean(selectedTask?.file_id);
+  const hasDownloadUrl = Boolean(selectedTask?.download_url);
+  const isRefreshBusy = Boolean(refreshingId);
 
   return (
     <main className="page">
       <header className="hero">
         <h1>MiniMax Text-to-Video MVP</h1>
-        <p>Phase D: task history alignment and compatibility matrix.</p>
+        <p>Phase E: download link refresh, polling guardrails, and API regression checks.</p>
       </header>
 
       <section className="card">
@@ -482,6 +633,10 @@ export default function App() {
           <span>Enable prompt_optimizer</span>
         </label>
 
+        <p className="warning">
+          Submitting a new task will create a real MiniMax text-to-video job and consume quota.
+        </p>
+
         <button className="button" type="submit" disabled={loading || !comboSupported || isPromptTooLong}>
           {showLoadingMessage}
         </button>
@@ -491,6 +646,7 @@ export default function App() {
         <h2>Task status</h2>
         {message && <p className="success">{message}</p>}
         {error && <p className="error">{error}</p>}
+        {info && <p className="hint">{info}</p>}
 
         {!selectedTask && <p>No task selected. Submit one or open from history.</p>}
         {selectedTask && (
@@ -500,35 +656,79 @@ export default function App() {
             <p><strong>Duration:</strong> {selectedTask.duration}s</p>
             <p><strong>Resolution:</strong> {selectedTask.resolution}</p>
             <p><strong>Status:</strong> {STATUS_TEXT[normalizeStatus(selectedTask.status)] || normalizeStatus(selectedTask.status)}</p>
-            <p><strong>Has file_id:</strong> {selectedTask.file_id ? 'Yes' : 'No'}</p>
-            <p><strong>Has download URL:</strong> {selectedTask.download_url ? 'Yes' : 'No'}</p>
+            <p><strong>file_id:</strong> {hasFileId ? `present (${shortId(selectedTask.file_id)})` : 'absent'}</p>
+            <p><strong>download_url:</strong> {hasDownloadUrl ? 'present' : 'absent'}</p>
             <p><strong>Created:</strong> {formatReadableTime(selectedTask.created_at)}</p>
             <p><strong>Updated:</strong> {formatReadableTime(selectedTask.updated_at)}</p>
+            {pollingState.active && (
+              <p className="hint">
+                Polling in progress (attempt {pollingState.attempt}/{pollingConfig.maxAttempts},
+                {' '}max {pollingConfig.maxDurationMinutes} min).
+              </p>
+            )}
+            {pollingState.reason && !pollingState.active && (
+              <p className="warning">Polling stopped: {pollingState.reason}.</p>
+            )}
             {selectedTask.fail_reason && (
               <p className="error">Fail reason: {selectedTask.fail_reason}</p>
             )}
+
+            <div className="task-actions">
+              <button
+                className="button ghost"
+                type="button"
+                disabled={isRefreshBusy}
+                onClick={() => refreshTaskStatus(selectedTask)}
+              >
+                {isRefreshBusy && refreshingId === selectedTask.task_id
+                  ? 'Refreshing status...'
+                  : 'Refresh task status'}
+              </button>
+              {terminalStatus === 'Fail' && (
+                <button
+                  className="button ghost"
+                  type="button"
+                  onClick={() => copyParamsToForm(selectedTask)}
+                >
+                  Copy params to recreate
+                </button>
+              )}
+            </div>
           </div>
         )}
 
-        {selectedTask?.status === 'Success' && selectedTask.download_url && (
+        {selectedTask?.status === 'Success' && hasDownloadUrl && (
           <div className="video-area">
             <h3>Generated result</h3>
             <video controls src={selectedTask.download_url} />
             <a className="link" href={selectedTask.download_url} target="_blank" rel="noreferrer">
               Download video
             </a>
-          </div>
-        )}
-
-        {selectedTask?.status === 'Success' && selectedTask.file_id && !selectedTask.download_url && (
-          <div className="notice">
-            <p>已生成，等待获取下载链接。</p>
             <button
               className="button ghost"
               type="button"
+              disabled={isRefreshBusy}
               onClick={() => refreshDownload(selectedTask)}
             >
-              刷新下载链接
+              {isRefreshBusy && refreshingId === selectedTask.file_id
+                ? 'Refreshing link...'
+                : 'Re-fetch download link'}
+            </button>
+          </div>
+        )}
+
+        {selectedTask?.status === 'Success' && hasFileId && !hasDownloadUrl && (
+          <div className="notice">
+            <p>已生成，等待获取下载链接。</p>
+            <button
+              className="button"
+              type="button"
+              disabled={isRefreshBusy}
+              onClick={() => refreshDownload(selectedTask)}
+            >
+              {isRefreshBusy && refreshingId === selectedTask.file_id
+                ? 'Refreshing link...'
+                : 'Refresh download link'}
             </button>
           </div>
         )}

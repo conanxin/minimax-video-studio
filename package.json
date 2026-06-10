@@ -14,6 +14,7 @@
     "start": "node server/index.js",
     "smoke:video": "node scripts/smoke-text-to-video.js",
     "import:local-smoke": "node scripts/import-local-smoke-to-db.js",
+    "check:api": "node scripts/check-api-regression.js",
     "check:open-source": "node scripts/check-open-source.js"
   },
   "dependencies": {

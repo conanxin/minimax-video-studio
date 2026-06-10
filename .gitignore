@@ -8,6 +8,7 @@ data/*.sqlite
 *.log
 
 reports/local/
+reports/phase-*.report.txt
 *.local.md
 *.local.json
 

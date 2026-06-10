@@ -6,6 +6,21 @@ const CREATE_PATH = '/v1/video_generation';
 const QUERY_PATH = '/v1/query/video_generation';
 const FILE_PATH = '/v1/files/retrieve';
 
+function maskId(value) {
+  if (value === undefined || value === null) return 'N/A';
+  const str = String(value).trim();
+  if (!str || str === 'N/A') return 'N/A';
+  if (str.length <= 10) return 'redacted';
+  return `${str.slice(0, 4)}...${str.slice(-4)}`;
+}
+
+function maskUrl(value) {
+  if (!value) return 'absent';
+  const str = String(value);
+  if (str.length <= 32) return 'present';
+  return 'present';
+}
+
 function assertApiKey() {
   if (!process.env.MINIMAX_API_KEY) {
     const err = new Error('MINIMAX_API_KEY is required.');
@@ -202,4 +217,6 @@ module.exports = {
   createTextToVideo,
   queryVideoTask,
   retrieveVideoFile,
+  maskId,
+  maskUrl,
 };
