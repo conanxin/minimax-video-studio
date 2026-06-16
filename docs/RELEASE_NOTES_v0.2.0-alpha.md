@@ -96,7 +96,7 @@ is not an official MiniMax product.
 ## Known limits
 
 1. **`check:api` regression expects 71/71 but currently reports
-   68/71** with three expected FAIL lines:
+   68/71** with four known FAIL lines:
    - `GET /api/tasks?limit=5&offset=0: no download_url leak` — the
      leak check is a regex that flags any 16+ char `http(s)://`
      fragment. After Phase J.4, the local SQLite store legitimately
@@ -111,12 +111,30 @@ is not an official MiniMax product.
      root cause.
    - `smoke:i2v dry-run does not create the real-smoke lock` —
      the check compares `lockBefore` and `lockAfter` and expects
-     both to be `false`. After Phase J.4, the once-only lock
+     both to be `false`. After Phase J.4 the once-only lock
      persists on disk, so both are `true`. Again, **not a
      regression**: the lock is meant to be sticky after a real
      submit. The check needs to be updated to "dry-run does not
      CREATE the lock" (i.e. the lock state must not change as a
      side-effect of a dry-run, not "be absent").
+   - (Discovered during Phase K) `npm run check:api` itself
+     **removes** the once-only lock as a side effect of the
+     "smoke:i2v real+lock+test-mode refuses via once-only
+     lock" sub-test
+     (`scripts/check-api-regression.js` line 1391:
+     `try { fs.unlinkSync(lockPath); } catch (_) {}`).
+     The script unlinks the real lock, plants a synthetic
+     one, runs the sub-test, and never restores the original.
+     After Phase J.4 turned the lock into a sticky safety
+     artifact, this is no longer safe. Phase K detected the
+     missing lock and reconstructed it from the Phase J.4
+     session record, with a `"restored_by_phase_k": true`
+     marker. The fix is a small refactor of line 1391 and
+     its surroundings: snapshot the original lock content
+     before the `unlinkSync`, and restore it after the
+     synthetic-lock test finishes. Until that lands, do
+     **not** trust the lock to be present after a
+     `npm run check:api` run.
 2. **The once-only lock is enforced by the smoke script only.**
    A motivated operator can still bypass it by hand-editing the
    smoke script or by calling the MiniMax API directly with the
