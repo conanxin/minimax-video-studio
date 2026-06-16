@@ -7,27 +7,28 @@ This repository is an open-source starter for cloning and local development. It 
 > You need your own MiniMax Token Plan API Key to run real generation.
 
 Current status:
-- `v0.1.0-alpha` has been published.
-- Phase C.1 real smoke test is verified once.
-- Phase D task history and parameter matrix are merged.
-- Phase E download link refresh, polling guardrails, and API regression
-  checks are merged.
-- Phase F task history UI, filtering, pagination, search, time
-  grouping, and copy-params affordances are merged.
-- Phase G download link freshness indicators and link-freshness UX
-  are merged.
-- Phase H error categorization and smoke dry-run hygiene are
-  merged.
-- Phase J controlled real I2V smoke and Phase J.2 incident
-  containment are recorded; the once-only local lock and the
-  redacted incident report are merged. Real I2V smoke is not
-  re-attempted without explicit operator authorization.
-- Phase J.3 I2V smoke harness fix is merged: the hand-written
-  PNG encoder is replaced by a deterministic pngjs-generated
-  fixture with offline pre-flight validation; the smoke harness
-  refuses to submit if the fixture is invalid or the once-only
-  lock is present.
-- Default smoke checks are non-consuming (dry run).
+- `v0.2.0-alpha` has been published (tag points to commit `ada27c9`).
+- T2V real smoke has been verified once.
+- I2V real smoke has been verified once (Phase J.4, fixture-driven
+  first frame, 10/10 offline fixture validation PASS).
+- Phase A–I feature surface is intact: text-to-video + image-to-video
+  task creation, task history, download-link refresh, polling
+  guardrails, freshness indicators (`fresh` / `aging` / `stale` /
+  `absent` / `unknown`), per-task error categorization, and
+  `npm run check:api` offline regression.
+- I2V fixture harness (Phase J.3) is the canonical path: a
+  pngjs-generated 1024×768 RGBA PNG is offline-validated (10/10 PASS)
+  before any real submit, and the smoke script refuses to submit if
+  the fixture is invalid.
+- Once-only local lock (`reports/local/i2v-real-smoke.lock`) remains
+  armed. A second real I2V submit is refused unless the operator
+  explicitly authorizes a new phase and removes the lock by hand.
+- Default smoke checks are non-consuming (dry run). `check:minimax-auth`
+  performs a Token Plan usage lookup only — it does NOT call
+  `/v1/video_generation` and consumes no video quota.
+- **Real smoke consumes video quota.** Any future controlled real
+  smoke (T2V or I2V) must be authorized explicitly per-phase; the
+  default path is dry-run only.
 
 ## Features
 
@@ -70,10 +71,10 @@ Current status:
 
 ## Function scope
 
-Current MVP scope remains text-to-video only:
+Current MVP scope (v0.2.0-alpha):
 
-- ✅ Text-to-video
-- ❌ Image-to-video
+- ✅ Text-to-video (real smoke verified)
+- ✅ Image-to-video (real smoke verified, fixture-driven first frame)
 - ❌ First/last frame conditioning
 - ❌ Subject reference video
 
@@ -826,3 +827,24 @@ Recommended process:
   `POST /api/video/file/:fileId/refresh` re-queries MiniMax for the
   current `download_url` without consuming additional generation
   quota.
+
+## Deployment
+
+This repo is an open-source starter. It is designed to be cloned and run
+on a single Tencent Cloud CVM (or any Linux box) for personal use; it is
+**not** intended to be exposed to the public internet without a reverse
+proxy + HTTPS termination, which is out of scope for v0.2.0-alpha.
+
+For the operator-facing, copy-pasteable Tencent Cloud CVM runbook — including
+`git clone`, `.env` creation, `npm install`, `npm run build`, `npm run start`,
+a placeholder systemd unit, and a health-check curl — see:
+
+- [`docs/TENCENT_CLOUD_DEPLOYMENT_RUNBOOK.md`](docs/TENCENT_CLOUD_DEPLOYMENT_RUNBOOK.md)
+
+The release notes for v0.2.0-alpha live at:
+
+- [`docs/RELEASE_NOTES_v0.2.0-alpha.md`](docs/RELEASE_NOTES_v0.2.0-alpha.md)
+
+The Phase K readiness report (offline, no real MiniMax submit) is at:
+
+- [`docs/PHASE_K_RELEASE_AND_DEPLOYMENT_READINESS_REPORT.md`](docs/PHASE_K_RELEASE_AND_DEPLOYMENT_READINESS_REPORT.md)
