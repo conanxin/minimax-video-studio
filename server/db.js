@@ -86,11 +86,43 @@ async function getTaskByFileId(db, fileId) {
   return db.get('SELECT * FROM tasks WHERE file_id = ?', [fileId]);
 }
 
-async function getRecentTasks(db, limit = 50, offset = 0) {
-  return db.all(
-    'SELECT * FROM tasks ORDER BY datetime(updated_at) DESC LIMIT ? OFFSET ?',
-    [limit, offset]
-  );
+const ALLOWED_SORT_ORDERS = new Set(['updated_desc', 'created_desc']);
+const ALLOWED_SORT_SQL = {
+  updated_desc: 'datetime(updated_at) DESC',
+  created_desc: 'datetime(created_at) DESC',
+};
+
+function buildTaskQuery({ status, q } = {}) {
+  const where = [];
+  const params = [];
+
+  if (status) {
+    where.push('status = ?');
+    params.push(status);
+  }
+
+  if (q && String(q).trim().length > 0) {
+    const token = `%${String(q).trim()}%`;
+    where.push('(prompt LIKE ? OR model LIKE ? OR task_id LIKE ?)');
+    params.push(token, token, token);
+  }
+
+  const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  return { whereSql, params };
+}
+
+async function getRecentTasks(db, { limit = 50, offset = 0, status = null, q = null, sort = 'updated_desc' } = {}) {
+  const sortKey = ALLOWED_SORT_ORDERS.has(sort) ? sort : 'updated_desc';
+  const orderSql = ALLOWED_SORT_SQL[sortKey];
+  const { whereSql, params } = buildTaskQuery({ status, q });
+  const sql = `SELECT * FROM tasks ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`;
+  return db.all(sql, [...params, limit, offset]);
+}
+
+async function countTasks(db, { status = null, q = null } = {}) {
+  const { whereSql, params } = buildTaskQuery({ status, q });
+  const row = await db.get(`SELECT COUNT(*) AS total FROM tasks ${whereSql}`, params);
+  return row?.total || 0;
 }
 
 function flattenUpdates(updates) {
@@ -146,6 +178,7 @@ module.exports = {
   getTaskByFileIdMapped,
   getRecentTasks,
   getRecentTasksMapped,
+  countTasks,
   updateTask,
   mapTask,
 };

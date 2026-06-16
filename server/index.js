@@ -9,6 +9,7 @@ const {
   getTaskByTaskId,
   getTaskByFileId,
   listTasks,
+  countFilteredTasks,
   updateTaskByTaskId,
   upsertTaskByTaskId,
   normalizeMiniMaxStatus,
@@ -264,14 +265,57 @@ app.post('/api/video/file/:fileId/refresh', requirePasscode, async (req, res) =>
   }
 });
 
-app.get('/api/tasks', requirePasscode, async (req, res) => {
-  const rawLimit = Number(req.query.limit || 100);
-  const rawOffset = Number(req.query.offset || 0);
-  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 50;
-  const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+const ALLOWED_STATUSES = new Set(['Preparing', 'Queueing', 'Processing', 'Success', 'Fail']);
+const TASK_LIST_DEFAULT_LIMIT = 20;
+const TASK_LIST_MAX_LIMIT = 100;
 
-  const tasks = await listTasks({ limit, offset });
-  res.json(tasks.map(toSafeTaskPayload));
+app.get('/api/tasks', requirePasscode, async (req, res) => {
+  const rawLimit = Number(req.query.limit ?? TASK_LIST_DEFAULT_LIMIT);
+  const rawOffset = Number(req.query.offset ?? 0);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0
+    ? Math.min(Math.floor(rawLimit), TASK_LIST_MAX_LIMIT)
+    : TASK_LIST_DEFAULT_LIMIT;
+  const offset = Number.isFinite(rawOffset) && rawOffset >= 0
+    ? Math.floor(rawOffset)
+    : 0;
+
+  const rawStatus = req.query.status ? String(req.query.status).trim() : null;
+  if (rawStatus && !ALLOWED_STATUSES.has(rawStatus)) {
+    return res.status(400).json({
+      error: `Invalid status. Allowed: ${Array.from(ALLOWED_STATUSES).join(', ')}.`,
+    });
+  }
+
+  const rawQ = req.query.q ? String(req.query.q).trim() : null;
+  const rawSort = req.query.sort ? String(req.query.sort).trim() : 'updated_desc';
+  if (!['updated_desc', 'created_desc'].includes(rawSort)) {
+    return res.status(400).json({
+      error: 'Invalid sort. Allowed: updated_desc, created_desc.',
+    });
+  }
+
+  try {
+    const [rows, total] = await Promise.all([
+      listTasks({ limit, offset, status: rawStatus, q: rawQ, sort: rawSort }),
+      countFilteredTasks({ status: rawStatus, q: rawQ }),
+    ]);
+    return res.json({
+      tasks: rows.map(toSafeTaskPayload),
+      pagination: {
+        limit,
+        offset,
+        total,
+        hasMore: offset + rows.length < total,
+      },
+      filters: {
+        status: rawStatus,
+        q: rawQ,
+        sort: rawSort,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to load tasks.' });
+  }
 });
 
 app.use(express.static(FRONTEND_DIST));

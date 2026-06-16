@@ -3,6 +3,7 @@ const {
   getTaskByTaskId,
   getTaskByFileId,
   getRecentTasks,
+  countTasks,
   initDb,
   updateTask,
   mapTask,
@@ -152,13 +153,26 @@ async function getTaskByFileIdRecord(fileId) {
   return mapTask(await getTaskByFileId(db, fileId));
 }
 
-async function listTasks({ limit = 50, offset = 0 } = {}) {
+async function listTasks({ limit = 50, offset = 0, status = null, q = null, sort = 'updated_desc' } = {}) {
   const db = await getDb();
-  const rows = await getRecentTasks(db, Number(limit) || 50, Number(offset) || 0);
+  const safeLimit = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Number(limit) : 50;
+  const safeOffset = Number.isFinite(Number(offset)) && Number(offset) >= 0 ? Number(offset) : 0;
+  const rows = await getRecentTasks(db, {
+    limit: safeLimit,
+    offset: safeOffset,
+    status: status || null,
+    q: q || null,
+    sort: sort || 'updated_desc',
+  });
   return rows.map((task) => mapTask({
     ...task,
     status: normalizeMiniMaxStatus(task.status),
   }));
+}
+
+async function countFilteredTasks({ status = null, q = null } = {}) {
+  const db = await getDb();
+  return countTasks(db, { status: status || null, q: q || null });
 }
 
 module.exports = {
@@ -175,4 +189,5 @@ module.exports = {
   getTaskByTaskId: getTaskByTaskIdRecord,
   getTaskByFileId: getTaskByFileIdRecord,
   listTasks,
+  countFilteredTasks,
 };

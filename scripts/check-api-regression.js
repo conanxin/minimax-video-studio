@@ -1,19 +1,23 @@
 #!/usr/bin/env node
 /**
- * Phase E - API regression check script.
+ * Phase E + Phase F - API regression check script.
  *
  * Goals:
  *  1. Boot the backend, run a small regression suite, then shut it down.
- *  2. Cover auth, validation, polling-config endpoint, and the file-refresh
- *     endpoint (only if a local Success + file_id task exists).
+ *  2. Cover auth, validation, polling-config endpoint, the file-refresh
+ *     endpoint (only if a local Success + file_id task exists), and the
+ *     Phase F task-list filtering, pagination, and search behaviour.
  *  3. NEVER call /api/video/create with a valid payload (that would consume
  *     MiniMax quota). Only the rejection paths are exercised.
  *  4. NEVER read, log, or print MINIMAX_API_KEY.
  *  5. NEVER set CONFIRM_REAL_VIDEO=1.
+ *  6. NEVER print a real download_url. The script only asserts
+ *     present/absent flags.
  *
  * Exit code:
  *   0 - all checks passed
  *   1 - one or more checks failed (details in stdout)
+ *   2 - aborted before run (e.g. CONFIRM_REAL_VIDEO=1 detected)
  */
 
 const { spawn } = require('child_process');
@@ -24,7 +28,7 @@ const { config } = require('dotenv');
 config();
 
 const ROOT = path.resolve(__dirname, '..');
-const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-e-api-regression.report.txt');
+const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-f-api-regression.report.txt');
 
 const PORT = Number(process.env.PORT) || 8789;
 const SITE_PASSCODE = String(process.env.SITE_PASSCODE || 'change_me').trim();
@@ -48,6 +52,26 @@ function recordResult(name, ok, detail) {
   checks.push({ name, ok: !!ok, detail });
   const tag = ok ? 'PASS' : 'FAIL';
   logLine(`  [${tag}] ${name}${detail ? ` - ${detail}` : ''}`);
+}
+
+function assertNoKeyLeakage(payload, label) {
+  const text = JSON.stringify(payload || {});
+  if (text.includes('MINIMAX_API_KEY') || /eyJ[A-Za-z0-9_-]{20,}/.test(text)) {
+    recordResult(`${label}: no key leak`, false, 'response body contained a key fragment');
+    return false;
+  }
+  recordResult(`${label}: no key leak`, true, 'no key fragment detected');
+  return true;
+}
+
+function assertNoDownloadUrlLeak(payload, label) {
+  const text = JSON.stringify(payload || {});
+  if (/https?:\/\/[^\s"']{16,}/.test(text)) {
+    recordResult(`${label}: no download_url leak`, false, 'response body contained a URL fragment');
+    return false;
+  }
+  recordResult(`${label}: no download_url leak`, true, 'no URL fragment detected');
+  return true;
 }
 
 async function waitForHealth(url, timeoutMs = 15000) {
@@ -246,6 +270,83 @@ async function runChecks() {
   } catch (err) {
     recordResult('Refresh on local Success+file_id', false, err.message);
   }
+
+  // 9. Phase F: GET /api/tasks?limit=5&offset=0 -> 200 with pagination block
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&limit=5&offset=0`);
+    const body = await r.json().catch(() => ({}));
+    const ok = r.status === 200
+      && Array.isArray(body.tasks)
+      && body.pagination
+      && body.pagination.limit === 5
+      && body.pagination.offset === 0
+      && Number.isFinite(body.pagination.total);
+    recordResult(
+      'GET /api/tasks?limit=5&offset=0 -> 200 with pagination block',
+      ok,
+      `status=${r.status} tasks=${Array.isArray(body.tasks) ? body.tasks.length : 'n/a'}`,
+    );
+    assertNoDownloadUrlLeak(body, 'GET /api/tasks?limit=5&offset=0');
+  } catch (err) {
+    recordResult('GET /api/tasks?limit=5&offset=0 -> 200 with pagination block', false, err.message);
+  }
+
+  // 10. Phase F: GET /api/tasks?status=Success -> 200
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&status=Success`);
+    const body = await r.json().catch(() => ({}));
+    const ok = r.status === 200
+      && Array.isArray(body.tasks)
+      && (!body.filters || body.filters.status === 'Success');
+    recordResult('GET /api/tasks?status=Success -> 200', ok, `status=${r.status}`);
+    assertNoDownloadUrlLeak(body, 'GET /api/tasks?status=Success');
+  } catch (err) {
+    recordResult('GET /api/tasks?status=Success -> 200', false, err.message);
+  }
+
+  // 11. Phase F: GET /api/tasks?status=InvalidStatus -> 400
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&status=InvalidStatus`);
+    const body = await r.json().catch(() => ({}));
+    recordResult(
+      'GET /api/tasks?status=InvalidStatus -> 400',
+      r.status === 400,
+      `status=${r.status} error="${body?.error || ''}"`,
+    );
+  } catch (err) {
+    recordResult('GET /api/tasks?status=InvalidStatus -> 400', false, err.message);
+  }
+
+  // 12. Phase F: GET /api/tasks?q=test -> 200, no SQL injection
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=${encodeURIComponent("test%' OR 1=1 --")}`);
+    const body = await r.json().catch(() => ({}));
+    const ok = r.status === 200 && Array.isArray(body.tasks);
+    recordResult(
+      'GET /api/tasks?q=<sql-injection-attempt> -> 200, no SQL injection',
+      ok,
+      `status=${r.status}`,
+    );
+    assertNoDownloadUrlLeak(body, 'GET /api/tasks?q=...');
+  } catch (err) {
+    recordResult('GET /api/tasks?q=<sql-injection-attempt> -> 200', false, err.message);
+  }
+
+  // 13. Phase F: GET /api/tasks?limit=999 -> 200, response limit is clamped to <= 100
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&limit=999`);
+    const body = await r.json().catch(() => ({}));
+    const clamped = r.status === 200
+      && body.pagination
+      && body.pagination.limit <= 100;
+    recordResult(
+      'GET /api/tasks?limit=999 -> 200, limit clamped to <= 100',
+      clamped,
+      `status=${r.status} pagination.limit=${body?.pagination?.limit}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/tasks?limit=999 -> 200, limit clamped', false, err.message);
+  }
 }
 
 async function main() {
@@ -257,19 +358,19 @@ async function main() {
     // ignore
   }
 
-  logLine(`[phase-e] check:api starting on port ${PORT}`);
+  logLine(`[phase-f] check:api starting on port ${PORT}`);
 
   if (process.env.CONFIRM_REAL_VIDEO === '1') {
-    logLine('[phase-e] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
+    logLine('[phase-f] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
     process.exitCode = 2;
     return;
   }
 
   try {
     await startServer();
-    logLine(`[phase-e] server up on :${PORT}`);
+    logLine(`[phase-f] server up on :${PORT}`);
   } catch (err) {
-    logLine(`[phase-e] failed to start server: ${err.message}`);
+    logLine(`[phase-f] failed to start server: ${err.message}`);
     process.exitCode = 1;
     return;
   }
@@ -282,18 +383,18 @@ async function main() {
 
   const passed = checks.filter((c) => c.ok).length;
   const failed = checks.length - passed;
-  logLine(`[phase-e] summary: ${passed}/${checks.length} checks passed`);
+  logLine(`[phase-f] summary: ${passed}/${checks.length} checks passed`);
   if (failed > 0) {
-    logLine(`[phase-e] FAILED checks:`);
+    logLine(`[phase-f] FAILED checks:`);
     checks.filter((c) => !c.ok).forEach((c) => logLine(`  - ${c.name}: ${c.detail || ''}`));
     process.exitCode = 1;
   } else {
-    logLine(`[phase-e] all checks PASSED. No real MiniMax task was created.`);
+    logLine(`[phase-f] all checks PASSED. No real MiniMax task was created.`);
   }
 }
 
 main().catch((err) => {
-  logLine(`[phase-e] unexpected error: ${err && err.message ? err.message : err}`);
+  logLine(`[phase-f] unexpected error: ${err && err.message ? err.message : err}`);
   stopServer();
   process.exitCode = 1;
 });

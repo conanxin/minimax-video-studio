@@ -45,6 +45,15 @@ const STATUS_TEXT = {
   Unknown: '未知',
 };
 
+const STATUS_FILTER_OPTIONS = [
+  { value: 'all', label: '全部' },
+  { value: 'Success', label: '成功' },
+  { value: 'Fail', label: '失败' },
+  { value: 'in_progress', label: '生成中' },
+];
+
+const HISTORY_PAGE_SIZE = 20;
+
 function normalizeStatus(status) {
   const value = String(status || '').toLowerCase();
   if (!value) return 'Unknown';
@@ -93,6 +102,44 @@ function formatReadableTime(value) {
   } catch {
     return value;
   }
+}
+
+function summarizePrompt(value, max = 80) {
+  if (!value) return '(empty prompt)';
+  const flat = String(value).replace(/\s+/g, ' ').trim();
+  if (flat.length <= max) return flat;
+  return `${flat.slice(0, max - 1)}…`;
+}
+
+function startOfLocalDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function groupLabelForIso(value) {
+  if (!value) return 'Earlier';
+  const target = new Date(value);
+  if (Number.isNaN(target.getTime())) return 'Earlier';
+  const today = startOfLocalDay(new Date());
+  const taskDay = startOfLocalDay(target);
+  const diffDays = Math.round((today - taskDay) / (1000 * 60 * 60 * 24));
+  if (diffDays <= 0) return 'Today';
+  if (diffDays === 1) return 'Yesterday';
+  return 'Earlier';
+}
+
+const GROUP_ORDER = ['Today', 'Yesterday', 'Earlier'];
+
+function groupTasksByDate(tasks) {
+  const groups = new Map();
+  for (const task of tasks || []) {
+    const label = groupLabelForIso(task.updated_at || task.created_at);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(task);
+  }
+  return GROUP_ORDER.filter((label) => groups.has(label)).map((label) => ({
+    label,
+    tasks: groups.get(label),
+  }));
 }
 
 function buildModelList(config) {
@@ -153,6 +200,12 @@ export default function App() {
   const [currentTask, setCurrentTask] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
   const [tasks, setTasks] = useState([]);
+  const [taskPagination, setTaskPagination] = useState({ limit: HISTORY_PAGE_SIZE, offset: 0, total: 0, hasMore: false });
+  const [historyStatus, setHistoryStatus] = useState('all');
+  const [historySearch, setHistorySearch] = useState('');
+  const [historySearchInput, setHistorySearchInput] = useState('');
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyNotice, setHistoryNotice] = useState('');
   const [pollingState, setPollingState] = useState({ active: false, attempt: 0, exhausted: false });
   const pollingTimer = useRef(null);
   const pollingStartedAt = useRef(null);
@@ -206,16 +259,16 @@ export default function App() {
   }, [duration, durations, model, resolutions, resolution, modelConfig]);
 
   useEffect(() => {
-    if (passcode) {
-      loadTasks();
-    }
-  }, [passcode]);
+    if (!passcode) return;
+    loadTasks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [passcode, historyStatus, historySearch]);
 
   useEffect(() => {
-    if (!passcode) {
-      return;
-    }
-    loadTasks();
+    if (!passcode) return;
+    if (!currentTask && !selectedTask) return;
+    loadTasks({ silent: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTask, currentTask]);
 
   useEffect(() => {
@@ -264,17 +317,115 @@ export default function App() {
     return data;
   }
 
-  async function loadTasks() {
+  function buildApiStatusFilter() {
+    if (historyStatus === 'in_progress') {
+      return 'Processing';
+    }
+    if (historyStatus === 'all') return null;
+    return historyStatus;
+  }
+
+  async function loadTasks({ offset = 0, silent = false } = {}) {
+    if (!passcode) return;
+    if (!silent) setHistoryLoading(true);
+    setHistoryNotice('');
     try {
-      const rows = await requestJson('/api/tasks');
+      const params = new URLSearchParams();
+      params.set('passcode', passcode);
+      params.set('limit', String(HISTORY_PAGE_SIZE));
+      params.set('offset', String(offset));
+      const apiStatus = buildApiStatusFilter();
+      if (apiStatus) params.set('status', apiStatus);
+      if (historySearch) params.set('q', historySearch);
+
+      const response = await fetch(`/api/tasks?${params.toString()}`);
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message = data?.error || `Request failed with HTTP ${response.status}`;
+        setError(message);
+        return;
+      }
+
+      const rows = Array.isArray(data?.tasks) ? data.tasks : [];
       const mapped = rows.map((row) => ({
         ...row,
         status: normalizeStatus(row.status),
       }));
       setTasks(mapped);
+      setTaskPagination({
+        limit: data?.pagination?.limit ?? HISTORY_PAGE_SIZE,
+        offset: data?.pagination?.offset ?? offset,
+        total: data?.pagination?.total ?? mapped.length,
+        hasMore: Boolean(data?.pagination?.hasMore),
+      });
+      if (!silent) setError('');
     } catch (err) {
-      setError(err.message || 'Failed to load task history.');
+      setError(err?.message || 'Failed to load task history.');
+    } finally {
+      if (!silent) setHistoryLoading(false);
     }
+  }
+
+  function handleSearchSubmit(e) {
+    e.preventDefault();
+    setHistorySearch(historySearchInput.trim());
+  }
+
+  function handleSearchReset() {
+    setHistorySearchInput('');
+    setHistorySearch('');
+  }
+
+  function handlePageChange(nextOffset) {
+    if (nextOffset < 0) return;
+    loadTasks({ offset: nextOffset });
+  }
+
+  async function copyTextToClipboard(text) {
+    if (!text) return false;
+    if (navigator?.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (_) {
+        // fall through to fallback
+      }
+    }
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'absolute';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function copyPromptToClipboard(task) {
+    if (!task?.prompt) return;
+    const ok = await copyTextToClipboard(String(task.prompt));
+    setInfo(ok ? 'Prompt 已复制到剪贴板。' : '复制失败，请手动复制。');
+    setError('');
+  }
+
+  async function copyParamsToClipboard(task) {
+    if (!task) return;
+    const payload = {
+      prompt: task.prompt || '',
+      model: task.model || FALLBACK_MODEL_CONFIG.defaults.model,
+      duration: Number(task.duration) || FALLBACK_MODEL_CONFIG.defaults.duration,
+      resolution: task.resolution || FALLBACK_MODEL_CONFIG.defaults.resolution,
+      prompt_optimizer: task.prompt_optimizer !== false,
+    };
+    const ok = await copyTextToClipboard(JSON.stringify(payload, null, 2));
+    setInfo(ok ? '任务参数 JSON 已复制到剪贴板。' : '复制失败，请手动复制。');
+    setError('');
   }
 
   function updateCurrentTask(task) {
@@ -284,7 +435,7 @@ export default function App() {
     }
     if (isTerminalStatus(task.status)) {
       stopPolling('reached terminal status');
-      loadTasks();
+      loadTasks({ silent: true });
     }
   }
 
@@ -444,7 +595,7 @@ export default function App() {
       setCurrentTask(normalized);
       setSelectedTask(normalized);
       setInfo(`Task ${shortTaskId(task.task_id)} status refreshed.`);
-      loadTasks();
+      loadTasks({ silent: true });
     } catch (err) {
       setError(err.message || 'Failed to refresh task status.');
     } finally {
@@ -476,7 +627,7 @@ export default function App() {
       setCurrentTask(updated);
       setSelectedTask(updated);
       setInfo(response.message || 'Download link refreshed.');
-      loadTasks();
+      loadTasks({ silent: true });
     } catch (err) {
       setError(err.message || 'Failed to refresh download link.');
     } finally {
@@ -525,7 +676,7 @@ export default function App() {
     <main className="page">
       <header className="hero">
         <h1>MiniMax Text-to-Video MVP</h1>
-        <p>Phase E: download link refresh, polling guardrails, and API regression checks.</p>
+        <p>Phase F: task history UI, filtering, pagination, and local usability polish.</p>
       </header>
 
       <section className="card">
@@ -684,6 +835,27 @@ export default function App() {
                   ? 'Refreshing status...'
                   : 'Refresh task status'}
               </button>
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() => copyPromptToClipboard(selectedTask)}
+              >
+                Copy Prompt
+              </button>
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() => copyParamsToClipboard(selectedTask)}
+              >
+                Copy task params
+              </button>
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() => copyParamsToForm(selectedTask)}
+              >
+                Fill form with these params
+              </button>
               {terminalStatus === 'Fail' && (
                 <button
                   className="button ghost"
@@ -694,6 +866,11 @@ export default function App() {
                 </button>
               )}
             </div>
+            {terminalStatus === 'Fail' && (
+              <p className="warning">
+                任务失败。重新提交会消耗 MiniMax 视频额度，请确认参数后再点击 Submit。
+              </p>
+            )}
           </div>
         )}
 
@@ -737,29 +914,147 @@ export default function App() {
       <section className="card">
         <div className="history-header">
           <h2>Task history</h2>
-          <button className="button ghost" type="button" onClick={loadTasks}>Refresh</button>
+          <button
+            className="button ghost"
+            type="button"
+            disabled={historyLoading}
+            onClick={() => loadTasks({ offset: taskPagination.offset })}
+          >
+            {historyLoading ? 'Refreshing...' : 'Refresh list'}
+          </button>
+        </div>
+
+        <div className="history-toolbar">
+          <div className="history-status-filter" role="tablist" aria-label="Filter tasks by status">
+            {STATUS_FILTER_OPTIONS.map((option) => {
+              const active = historyStatus === option.value;
+              return (
+                <button
+                  type="button"
+                  key={option.value}
+                  className={`chip ${active ? 'active' : ''}`}
+                  aria-pressed={active}
+                  onClick={() => {
+                    setHistoryStatus(option.value);
+                    setHistoryNotice('');
+                  }}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <form className="history-search" onSubmit={handleSearchSubmit}>
+            <input
+              className="input"
+              type="search"
+              placeholder="搜索 prompt / model / task_id"
+              value={historySearchInput}
+              onChange={(e) => setHistorySearchInput(e.target.value)}
+            />
+            <div className="history-search-actions">
+              <button className="button ghost" type="submit">搜索</button>
+              {(historySearch || historySearchInput) && (
+                <button
+                  className="button ghost"
+                  type="button"
+                  onClick={handleSearchReset}
+                >
+                  清空
+                </button>
+              )}
+            </div>
+          </form>
+        </div>
+
+        {historyNotice && <p className="hint">{historyNotice}</p>}
+
+        <div className="history-summary">
+          {historySearch || historyStatus !== 'all' ? (
+            <span>
+              当前筛选：{STATUS_FILTER_OPTIONS.find((opt) => opt.value === historyStatus)?.label || '全部'}
+              {historySearch ? ` · 关键词 "${historySearch}"` : ''}
+            </span>
+          ) : (
+            <span>显示最近的任务，默认按更新时间倒序。</span>
+          )}
+          <span>
+            共 {taskPagination.total} 条 · 第 {taskPagination.offset + 1}–{Math.min(taskPagination.offset + taskPagination.limit, taskPagination.total)} 条
+          </span>
         </div>
 
         {tasks.length === 0 ? (
-          <p>No local task history yet.</p>
+          <p className="empty-state">
+            {historySearch || historyStatus !== 'all'
+              ? '没有匹配的任务，试试清空筛选条件。'
+              : '还没有任务。创建一个文生视频任务后会显示在这里。'}
+          </p>
         ) : (
-          <ul className="history-list">
-            {tasks.map((task) => (
-              <li
-                key={task.task_id}
-                className={`history-item ${selectedTask?.task_id === task.task_id ? 'selected' : ''}`}
-                onClick={() => openTask(task)}
-              >
-                <div>
-                  <strong>{shortTaskId(task.task_id)}</strong>
-                  <p>{formatReadableTime(task.created_at)}</p>
-                  <p>{STATUS_TEXT[task.status] || task.status}</p>
-                </div>
-                <span className={`badge ${task.status.toLowerCase()}`}>{STATUS_TEXT[task.status] || task.status}</span>
-              </li>
+          <div className="history-groups">
+            {groupTasksByDate(tasks).map((group) => (
+              <div className="history-group" key={group.label}>
+                <h3 className="history-group-title">{group.label}</h3>
+                <ul className="history-list">
+                  {group.tasks.map((task) => {
+                    const statusClass = String(task.status || '').toLowerCase();
+                    const statusLabel = STATUS_TEXT[task.status] || task.status;
+                    const fileIdLabel = task.file_id
+                      ? `present (${shortId(task.file_id)})`
+                      : 'absent';
+                    const downloadLabel = task.download_url ? 'present' : 'absent';
+                    const isSelected = selectedTask?.task_id === task.task_id;
+                    return (
+                      <li
+                        key={task.task_id}
+                        className={`history-item ${isSelected ? 'selected' : ''}`}
+                        onClick={() => openTask(task)}
+                      >
+                        <div className="history-item-main">
+                          <p className="history-item-prompt" title={task.prompt || ''}>
+                            {summarizePrompt(task.prompt)}
+                          </p>
+                          <p className="history-item-meta">
+                            <span className={`status-pill status-${statusClass}`}>{statusLabel}</span>
+                            <span>model: {task.model || '-'}</span>
+                            <span>{task.duration || '-'}s · {task.resolution || '-'}</span>
+                            <span>file_id: {fileIdLabel}</span>
+                            <span>download_url: {downloadLabel}</span>
+                          </p>
+                          <p className="history-item-time">
+                            更新 {formatReadableTime(task.updated_at)}
+                          </p>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
             ))}
-          </ul>
+          </div>
         )}
+
+        <div className="history-pagination">
+          <button
+            type="button"
+            className="button ghost"
+            disabled={historyLoading || taskPagination.offset === 0}
+            onClick={() => handlePageChange(Math.max(0, taskPagination.offset - taskPagination.limit))}
+          >
+            上一页
+          </button>
+          <span className="pagination-info">
+            第 {Math.floor(taskPagination.offset / taskPagination.limit) + 1} 页 · 每页 {taskPagination.limit} 条
+          </span>
+          <button
+            type="button"
+            className="button ghost"
+            disabled={historyLoading || !taskPagination.hasMore}
+            onClick={() => handlePageChange(taskPagination.offset + taskPagination.limit)}
+          >
+            下一页
+          </button>
+        </div>
       </section>
     </main>
   );

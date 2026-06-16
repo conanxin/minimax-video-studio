@@ -12,6 +12,8 @@ Current status:
 - Phase D task history and parameter matrix are merged.
 - Phase E download link refresh, polling guardrails, and API regression
   checks are merged.
+- Phase F task history UI, filtering, pagination, search, time
+  grouping, and copy-params affordances are merged.
 - Default smoke checks are non-consuming (dry run).
 
 ## Features
@@ -23,7 +25,11 @@ Current status:
 - Manual `Refresh download link` button for `Success + file_id` tasks
 - Re-fetch download link when the original `download_url` is missing
   or expired (`POST /api/video/file/:fileId/refresh`)
-- Task history listing and detail view
+- Task history listing with status filter, keyword search, and
+  paginated backend (`GET /api/tasks?limit=&offset=&status=&q=`)
+- Time-grouped task history (Today / Yesterday / Earlier)
+- Copy Prompt / Copy task params (JSON) / Fill form with these
+  params buttons in the task detail panel
 - Task compatibility validation before submit
 - Video playback + download link when available
 - Simple page passcode protection (`SITE_PASSCODE`)
@@ -44,6 +50,12 @@ Current MVP scope remains text-to-video only:
 Phase E explicitly does **not** introduce any of: image-to-video,
 first/last frame, subject reference, Docker packaging, CI/CD, or
 dependency hygiene refactors.
+
+Phase F keeps the same scope discipline. It only polishes the local
+task history UI (filtering, pagination, search, time grouping,
+copy-params affordances) and the matching backend
+`GET /api/tasks` endpoint. It does **not** introduce new
+generation modes, Docker, CI, or dependency changes.
 
 ## Project structure
 
@@ -144,14 +156,78 @@ npm run smoke:video
   - If a local `Success + file_id` task exists, the refresh endpoint
     is exercised and the script asserts no real `download_url` is
     printed in the response body
+  - `GET /api/tasks?limit=5&offset=0` returns 200 with a pagination
+    block (`limit`, `offset`, `total`, `hasMore`)
+  - `GET /api/tasks?status=Success` returns 200
+  - `GET /api/tasks?status=InvalidStatus` returns 400
+  - `GET /api/tasks?q=<text>` returns 200; the keyword uses
+    parameterized SQL, so injection attempts return 200 with an
+    empty / partial result set instead of leaking data
+  - `GET /api/tasks?limit=999` returns 200 with `pagination.limit`
+    clamped to `<= 100`
 - The script aborts immediately if `CONFIRM_REAL_VIDEO=1` is set.
 - The script never reads, logs, or prints `MINIMAX_API_KEY`.
+- The script never prints a real `download_url`; it only asserts
+  presence/absence.
 - The run output is appended to
-  `reports/phase-e-api-regression.report.txt` (gitignored).
+  `reports/phase-f-api-regression.report.txt` (gitignored).
 
 ```bash
 npm run check:api
 ```
+
+## Task history filtering, pagination, and search
+
+`GET /api/tasks` now accepts the following query parameters (all
+require `passcode`):
+
+| Param   | Type    | Default        | Notes |
+|---------|---------|----------------|-------|
+| `limit` | integer | `20`           | Clamped to a maximum of `100` server-side |
+| `offset`| integer | `0`            | Non-negative integer |
+| `status`| string  | (unset)        | One of `Preparing`, `Queueing`, `Processing`, `Success`, `Fail`; anything else returns `400` |
+| `q`     | string  | (unset)        | Searches `prompt`, `model`, and `task_id` with parameterized `LIKE` |
+| `sort`  | string  | `updated_desc` | One of `updated_desc`, `created_desc`; anything else returns `400` |
+
+Response shape:
+
+```json
+{
+  "tasks": [ { "id": 1, "task_id": "...", "status": "Success", ... } ],
+  "pagination": { "limit": 20, "offset": 0, "total": 42, "hasMore": true },
+  "filters": { "status": "Success", "q": "windmill", "sort": "updated_desc" }
+}
+```
+
+The frontend groups the current page into **Today**, **Yesterday**,
+and **Earlier** sections using the task's `updated_at` timestamp,
+shows a status pill plus a single-line `model / duration / resolution
+/ file_id / download_url` summary per card, and renders clear empty
+states for both "no tasks yet" and "no tasks match the current
+filter" cases.
+
+The `q` value is bound through `?` parameters in `sqlite3`, so it is
+safe against SQL injection.
+
+## Task detail copy / fill-form affordances
+
+The task detail panel now exposes four buttons in addition to the
+existing refresh actions:
+
+- **Copy Prompt** — copies the raw `prompt` string to the clipboard.
+- **Copy task params** — copies a JSON object containing `prompt`,
+  `model`, `duration`, `resolution`, and `prompt_optimizer` to the
+  clipboard.
+- **Fill form with these params** — populates the create form
+  (model, duration, resolution, `prompt_optimizer`, and prompt)
+  with the task's parameters. The user must review and click
+  **Submit** manually. A new submission will consume MiniMax quota.
+- **Copy params to recreate** (failed tasks only) — same effect as
+  the previous Phase E button, kept for clarity on failed tasks.
+
+For failed tasks the panel shows an additional red-bordered warning
+reminding the user that a fresh submission will consume MiniMax
+quota. The buttons never auto-submit.
 
 ## Polling guardrails
 
