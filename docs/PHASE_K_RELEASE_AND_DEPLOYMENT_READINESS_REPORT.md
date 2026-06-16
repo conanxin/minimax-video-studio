@@ -51,13 +51,63 @@ The phase's deliverables were:
 
 | Concern | Value | Notes |
 | --- | --- | --- |
-| Real MiniMax video tasks created | **No** | `CONFIRM_REAL_VIDEO=1` and `CONFIRM_REAL_I2V=1` were not set at any point. |
-| Video quota consumed | **No** | None of the verification commands calls `/v1/video_generation`. |
+| Real MiniMax video tasks created | **No** | `CONFIRM_REAL_VIDEO=1` and `CONFIRM_REAL_I2V=1` were not set during the standard verification commands. The shell session had inherited these vars from Phase J.4 (terminal env state persists across calls), and the dry-run `npm run smoke:i2v` saw them as set, walked into the REAL branch, and was **stopped by the once-only lock** before any `/v1/video_generation` call. `real_quota_consumed: No` is the authoritative signal. |
+| Video quota consumed | **No** | The lock stopped the smoke script before any remote call. `chargeUsed` in the local report is `No`. |
 | `task_id` / `file_id` / `download_url` produced | **No (this phase)** | The single Phase J.4 I2V task is already in the local SQLite store; Phase K only read from it indirectly via the test client. |
-| `reports/local/i2v-real-smoke.lock` removed | **No** | The lock is sticky and is the post-Phase-J.4 safety state. Phase K does not touch it. |
+| `reports/local/i2v-real-smoke.lock` removed | **Indirectly, by `check:api` side effect — then restored** | See "Discovered deviation" §2.1 below. |
 | New dependency added | **No** | `package.json` is unchanged from `ada27c9`. |
 | New HTTP endpoint added | **No** | All new content is in `README.md` and `docs/`. |
 | New tag created | **No** | `v0.2.0-alpha` already exists from Phase J.4. |
+
+### 2.1. Discovered deviation: `check:api` removes the real I2V lock
+
+`scripts/check-api-regression.js` line 1391 contains:
+
+```js
+try { fs.unlinkSync(lockPath); } catch (_) { /* ignore */ }
+```
+
+This `unlinkSync` runs as part of the
+"smoke:i2v real+lock+test-mode refuses via once-only lock"
+sub-test, before planting a *synthetic* lock. After the sub-test
+finishes, the script does **not** restore the original lock — it
+leaves the synthetic one in place, and the next thing
+(`npm run smoke:i2v` in dry-run mode) overwrites that with
+its own refuse-by-lock report. Net effect: by the end of
+`npm run check:api`, the real once-only lock is gone.
+
+This is a Phase J.3-era test affordance: the lock was treated
+as ephemeral-test-fixture back then. After Phase J.4 turned
+the lock into a sticky safety artifact, that affordance is
+**not** safe any more.
+
+**Phase K mitigation** (not a fix, just a recovery):
+
+1. Phase K detected the missing lock immediately after running
+   `npm run check:api` (this report's author cross-checked the
+   filesystem after the verification suite).
+2. Phase K reconstructed the lock from the Phase J.4 real-smoke
+   session record and re-wrote it to
+   `reports/local/i2v-real-smoke.lock` with permissions `600`.
+3. The reconstructed lock is annotated with
+   `"restored_by_phase_k": true` and a `note` explaining why
+   the reconstruction happened. The file is gitignored and is
+   operator-local.
+4. No new I2V submit was attempted during the recovery.
+
+**This is exactly the kind of "check:api rule is no longer
+aligned with post-Phase-J.4 reality" item that §1 of the release
+notes already calls out** — and is one of the strongest
+arguments for opening Phase L sooner rather than later. The
+fix for line 1391 is straightforward: snapshot the original
+lock content (if any) before the `unlinkSync`, and restore it
+after the synthetic-lock test finishes.
+
+**Operator-facing summary**: the once-only lock is currently
+in place at `reports/local/i2v-real-smoke.lock`. It is
+authoritative for "no second real I2V submit". It will be
+**removed again** the next time `npm run check:api` runs
+unless the line-1391 fix lands first.
 
 ---
 
