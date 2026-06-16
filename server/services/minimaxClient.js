@@ -146,6 +146,61 @@ async function createTextToVideo(payload) {
   }
 }
 
+async function createImageToVideo(payload) {
+  // Phase I Recovery - image-to-video shares the same /v1/video_generation
+  // endpoint, with first_frame_image injected into the body. The image
+  // field is intentionally NEVER logged. Any value that could be a
+  // first_frame_image is dropped from the error envelope before
+  // safeApiError is called.
+  const body = {
+    model: payload.model,
+    prompt: payload.prompt,
+    duration: Number(payload.duration),
+    resolution: payload.resolution,
+    prompt_optimizer: Boolean(payload.prompt_optimizer),
+    first_frame_image: payload.first_frame_image,
+  };
+  try {
+    const response = await axios.post(
+      `${BASE_URL}${CREATE_PATH}`,
+      body,
+      {
+        headers: requestHeaders(),
+        timeout: 30000,
+      }
+    );
+
+    const data = response.data || {};
+    checkBusinessError(data);
+
+    return {
+      task_id: extractTaskId(data),
+      status: extractStatus(data) || 'submitted',
+      file_id: extractFileId(data),
+      download_url: extractDownloadUrl(data),
+      fail_reason: null,
+      raw: data,
+    };
+  } catch (error) {
+    // Strip first_frame_image from any echoed body so the upstream
+    // error envelope never carries the image bytes.
+    if (error && error.config && error.config.data) {
+      try {
+        const parsed = typeof error.config.data === 'string'
+          ? JSON.parse(error.config.data)
+          : error.config.data;
+        if (parsed && 'first_frame_image' in parsed) {
+          delete parsed.first_frame_image;
+          error.config.data = JSON.stringify(parsed);
+        }
+      } catch (_err) {
+        // best-effort scrub; never throw from error handler
+      }
+    }
+    throw safeApiError(error);
+  }
+}
+
 async function queryVideoTask(taskId) {
   try {
     const response = await axios.get(`${BASE_URL}${QUERY_PATH}`, {
@@ -215,6 +270,7 @@ function mapTaskStatus(status) {
 
 module.exports = {
   createTextToVideo,
+  createImageToVideo,
   queryVideoTask,
   retrieveVideoFile,
   maskId,

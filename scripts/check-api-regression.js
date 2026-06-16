@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Phase E + Phase F + Phase G + Phase H - API regression check script.
+ * Phase E + Phase F + Phase G + Phase H + Phase I Recovery - API regression
+ * check script.
  *
  * Goals:
  *  1. Boot the backend, run a small regression suite, then shut it down.
@@ -30,7 +31,7 @@ const { config } = require('dotenv');
 config();
 
 const ROOT = path.resolve(__dirname, '..');
-const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-h-api-regression.report.txt');
+const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-i-api-regression.report.txt');
 
 const PORT = Number(process.env.PORT) || 8789;
 const SITE_PASSCODE = String(process.env.SITE_PASSCODE || 'change_me').trim();
@@ -130,6 +131,30 @@ function seedFixtures() {
         if (!have('download_url_status')) {
           await db.exec("ALTER TABLE tasks ADD COLUMN download_url_status TEXT DEFAULT 'unknown'");
         }
+        if (!have('generation_mode')) {
+          await db.exec("ALTER TABLE tasks ADD COLUMN generation_mode TEXT DEFAULT 'text_to_video'");
+        }
+        if (!have('input_image_present')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN input_image_present INTEGER DEFAULT 0');
+        }
+        if (!have('input_image_type')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN input_image_type TEXT');
+        }
+        if (!have('input_image_host')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN input_image_host TEXT');
+        }
+        if (!have('input_image_mime')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN input_image_mime TEXT');
+        }
+        if (!have('input_image_approx_bytes')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN input_image_approx_bytes INTEGER');
+        }
+        if (!have('input_image_sha256_short')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN input_image_sha256_short TEXT');
+        }
+        if (!have('input_image_summary')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN input_image_summary TEXT');
+        }
 
         const now = Date.now();
         const isoOffset = (hours) => new Date(now - hours * 60 * 60 * 1000).toISOString();
@@ -217,6 +242,95 @@ function seedFixtures() {
             refreshed_at: null,
             updated_at: isoOffset(4),
           },
+          // Phase I Recovery: image-related fail fixtures
+          {
+            task_id: 'local-seed-i-fail-image-unavailable',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'MiniMax returned: image url unavailable, failed to download image',
+            refreshed_at: null,
+            updated_at: isoOffset(5),
+            generation_mode: 'image_to_video',
+            input_image_present: true,
+            input_image_type: 'public_url',
+            input_image_host: 'cdn.example.invalid',
+            input_image_mime: 'image/png',
+            input_image_approx_bytes: 102400,
+            input_image_sha256_short: 'deadbeef',
+            input_image_summary: 'Public URL image, host=cdn.example.invalid',
+          },
+          {
+            task_id: 'local-seed-i-fail-image-too-large',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'MiniMax returned: image too large, exceeds 20mb',
+            refreshed_at: null,
+            updated_at: isoOffset(6),
+            generation_mode: 'image_to_video',
+            input_image_present: true,
+            input_image_type: 'data_url',
+            input_image_host: null,
+            input_image_mime: 'image/jpeg',
+            input_image_approx_bytes: 25 * 1024 * 1024,
+            input_image_sha256_short: 'f00dface',
+            input_image_summary: 'Data URL image, mime=image/jpeg, ~26214400 bytes',
+          },
+          {
+            task_id: 'local-seed-i-fail-image-format',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'MiniMax returned: unsupported image format, not jpg png webp',
+            refreshed_at: null,
+            updated_at: isoOffset(7),
+            generation_mode: 'image_to_video',
+            input_image_present: true,
+            input_image_type: 'data_url',
+            input_image_host: null,
+            input_image_mime: 'image/bmp',
+            input_image_approx_bytes: 204800,
+            input_image_sha256_short: 'cafebabe',
+            input_image_summary: 'Data URL image, mime=image/bmp, ~204800 bytes',
+          },
+          {
+            task_id: 'local-seed-i-fail-image-dimensions',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'MiniMax returned: image dimension too small, short side 100px',
+            refreshed_at: null,
+            updated_at: isoOffset(8),
+            generation_mode: 'image_to_video',
+            input_image_present: true,
+            input_image_type: 'public_url',
+            input_image_host: 'img.example.invalid',
+            input_image_mime: 'image/png',
+            input_image_approx_bytes: 4096,
+            input_image_sha256_short: '12345678',
+            input_image_summary: 'Public URL image, host=img.example.invalid',
+          },
+          // Phase I Recovery: a healthy-looking I2V task that should NOT
+          // be created by check:api. It is seeded so the safe-payload
+          // projection can be exercised end-to-end.
+          {
+            task_id: 'local-seed-i-success',
+            status: 'Success',
+            file_id: 'file-seed-i-success',
+            download_url: 'local-placeholder://i2v-success',
+            fail_reason: null,
+            refreshed_at: isoOffset(1),
+            updated_at: isoOffset(1),
+            generation_mode: 'image_to_video',
+            input_image_present: true,
+            input_image_type: 'data_url',
+            input_image_host: null,
+            input_image_mime: 'image/png',
+            input_image_approx_bytes: 8192,
+            input_image_sha256_short: 'abcd1234',
+            input_image_summary: 'Data URL image, mime=image/png, ~8192 bytes',
+          },
         ];
 
         for (const r of rows) {
@@ -225,11 +339,14 @@ function seedFixtures() {
               task_id, prompt, model, duration, resolution, prompt_optimizer,
               status, file_id, download_url, fail_reason,
               created_at, updated_at,
-              download_url_refreshed_at, download_url_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              download_url_refreshed_at, download_url_status,
+              generation_mode, input_image_present, input_image_type,
+              input_image_host, input_image_mime, input_image_approx_bytes,
+              input_image_sha256_short, input_image_summary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               r.task_id,
-              'Phase G/H seed prompt for regression check',
+              'Phase G/H/I seed prompt for regression check',
               'MiniMax-Hailuo-2.3',
               6,
               '768P',
@@ -242,7 +359,15 @@ function seedFixtures() {
               r.updated_at,
               r.refreshed_at,
               null,
-            ],
+              r.generation_mode || 'text_to_video',
+              r.input_image_present ? 1 : 0,
+              r.input_image_type || null,
+              r.input_image_host || null,
+              r.input_image_mime || null,
+              r.input_image_approx_bytes || null,
+              r.input_image_sha256_short || null,
+              r.input_image_summary || null,
+            ]
           );
         }
         await db.close();
@@ -812,6 +937,327 @@ async function runChecks() {
   } catch (err) {
     recordResult('smoke dry-run hygiene', false, err.message);
   }
+
+  // ===========================================================
+  // Phase I Recovery - image-to-video offline checks.
+  //  - 5 I2V 400 rejection paths (no MiniMax call)
+  //  - 4 errorClassifier image-related unit tests
+  //  - 4 safe-payload / I2V seed coverage checks
+  // All checks run against the offline SQLite seed and the local
+  // validator. They never call /v1/video_generation.
+  // ===========================================================
+
+  // 30. Phase I: image_to_video missing first_frame_image -> 400
+  try {
+    const r = await fetch(`${base}/api/video/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        passcode: SITE_PASSCODE,
+        generation_mode: 'image_to_video',
+        prompt: 'phase I missing image check',
+        model: 'MiniMax-Hailuo-2.3',
+        duration: 6,
+        resolution: '768P',
+        prompt_optimizer: true,
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    const noMiniMax = !serverStderr.includes('MiniMax I2V created');
+    recordResult(
+      'POST /api/video/create image_to_video missing image -> 400',
+      r.status === 400 && /first_frame_image is required/i.test(body.error || ''),
+      `status=${r.status} error="${body?.error || ''}"`,
+    );
+    recordResult(
+      'POST /api/video/create image_to_video missing image did not call MiniMax',
+      noMiniMax,
+      'rejected before remote call',
+    );
+  } catch (err) {
+    recordResult('POST /api/video/create i2v missing image -> 400', false, err.message);
+  }
+
+  // 31. Phase I: image_to_video http://private/local URL -> 400
+  try {
+    const cases = [
+      { label: 'http://', value: 'http://example.com/x.png' },
+      { label: 'localhost', value: 'https://localhost/x.png' },
+      { label: 'private-10', value: 'https://10.0.0.1/x.png' },
+      { label: 'private-192', value: 'https://192.168.1.1/x.png' },
+      { label: 'file://', value: 'file:///etc/passwd' },
+    ];
+    let allOk = true;
+    const details = [];
+    for (const c of cases) {
+      const r = await fetch(`${base}/api/video/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          passcode: SITE_PASSCODE,
+          generation_mode: 'image_to_video',
+          prompt: 'phase I private url check',
+          model: 'MiniMax-Hailuo-2.3',
+          duration: 6,
+          resolution: '768P',
+          first_frame_image: c.value,
+        }),
+      });
+      const body = await r.json().catch(() => ({}));
+      const ok = r.status === 400;
+      allOk = allOk && ok;
+      details.push(`${c.label}=${r.status}`);
+    }
+    recordResult(
+      'POST /api/video/create image_to_video private/local URLs -> 400',
+      allOk,
+      details.join(' '),
+    );
+  } catch (err) {
+    recordResult('POST /api/video/create i2v private URLs', false, err.message);
+  }
+
+  // 32. Phase I: image_to_video unsupported Data URL MIME -> 400
+  try {
+    const r = await fetch(`${base}/api/video/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        passcode: SITE_PASSCODE,
+        generation_mode: 'image_to_video',
+        prompt: 'phase I bad mime check',
+        model: 'MiniMax-Hailuo-2.3',
+        duration: 6,
+        resolution: '768P',
+        first_frame_image: 'data:image/svg+xml;base64,PHN2Zy8+',
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    recordResult(
+      'POST /api/video/create image_to_video svg Data URL -> 400',
+      r.status === 400 && /unsupported.*format|svg/i.test(body.error || ''),
+      `status=${r.status} error="${body?.error || ''}"`,
+    );
+  } catch (err) {
+    recordResult('POST /api/video/create i2v svg', false, err.message);
+  }
+
+  // 33. Phase I: image_to_video oversize Data URL -> 400 (validator: base64 length check)
+  try {
+    // Build a synthetic Data URL whose base64 payload implies > 20MB.
+    // The validator only inspects the base64 length, so we can use
+    // any content; we never send it to MiniMax.
+    const padding = 'A'.repeat(28 * 1024 * 1024 / 3 * 4 + 16);
+    const dataUrl = `data:image/png;base64,${padding}`;
+    const r = await fetch(`${base}/api/video/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        passcode: SITE_PASSCODE,
+        generation_mode: 'image_to_video',
+        prompt: 'phase I oversize check',
+        model: 'MiniMax-Hailuo-2.3',
+        duration: 6,
+        resolution: '768P',
+        first_frame_image: dataUrl,
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    recordResult(
+      'POST /api/video/create image_to_video over-20MB Data URL -> 400',
+      r.status === 400 && /too large|20mb|bytes/i.test(body.error || ''),
+      `status=${r.status} error="${body?.error || ''}"`,
+    );
+  } catch (err) {
+    recordResult('POST /api/video/create i2v oversize', false, err.message);
+  }
+
+  // 34. Phase I: image_to_video invalid I2V model/duration/resolution combo -> 400
+  try {
+    const r = await fetch(`${base}/api/video/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        passcode: SITE_PASSCODE,
+        generation_mode: 'image_to_video',
+        prompt: 'phase I combo check',
+        model: 'I2V-01',
+        duration: 10, // not in I2V-01 matrix
+        resolution: '720P',
+        first_frame_image: 'https://example.com/img.png',
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    recordResult(
+      'POST /api/video/create image_to_video invalid I2V combo -> 400',
+      r.status === 400 && /I2V-01.*10s|10s.*I2V-01|does not support/i.test(body.error || ''),
+      `status=${r.status} error="${body?.error || ''}"`,
+    );
+  } catch (err) {
+    recordResult('POST /api/video/create i2v invalid combo', false, err.message);
+  }
+
+  // 35. Phase I: errorClassifier: image_unavailable
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'image url unavailable' }).error_category;
+    recordResult('errorClassifier: image url unavailable -> image_unavailable', got === 'image_unavailable', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: image_unavailable', false, err.message);
+  }
+
+  // 36. Phase I: errorClassifier: image_too_large
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'image too large, exceeds 20mb' }).error_category;
+    recordResult('errorClassifier: image too large -> image_too_large', got === 'image_too_large', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: image_too_large', false, err.message);
+  }
+
+  // 37. Phase I: errorClassifier: unsupported_image_format
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'unsupported image format' }).error_category;
+    recordResult('errorClassifier: unsupported image format -> unsupported_image_format', got === 'unsupported_image_format', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: unsupported_image_format', false, err.message);
+  }
+
+  // 38. Phase I: errorClassifier: invalid_image_dimensions
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'image dimension too small' }).error_category;
+    recordResult('errorClassifier: image dimension too small -> invalid_image_dimensions', got === 'invalid_image_dimensions', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: invalid_image_dimensions', false, err.message);
+  }
+
+  // 39. Phase I: GET /api/tasks returns image_* summary fields for I2V seed rows
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-i-fail-image-unavailable`);
+    const body = await r.json().catch(() => ({}));
+    const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === 'local-seed-i-fail-image-unavailable') : null;
+    const ok = r.status === 200
+      && t
+      && t.generation_mode === 'image_to_video'
+      && t.error_category === 'image_unavailable'
+      && t.input_image_present === true
+      && t.input_image_type === 'public_url'
+      && t.input_image_host === 'cdn.example.invalid'
+      && typeof t.input_image_sha256_short === 'string'
+      && t.input_image_sha256_short.length > 0
+      && /first frame image|first frame|public url|public/i.test(t.input_image_summary || '');
+    recordResult(
+      'GET /api/tasks I2V seed row -> image_to_video + image_unavailable + image summary',
+      ok,
+      `mode=${t?.generation_mode} cat=${t?.error_category} host=${t?.input_image_host}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/tasks I2V seed summary', false, err.message);
+  }
+
+  // 40. Phase I: GET /api/tasks I2V Success seed -> generation_mode + safe payload
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-i-success`);
+    const body = await r.json().catch(() => ({}));
+    const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === 'local-seed-i-success') : null;
+    const ok = r.status === 200
+      && t
+      && t.generation_mode === 'image_to_video'
+      && t.status === 'Success'
+      && t.file_id === 'file-seed-i-success'
+      && t.input_image_present === true
+      && t.input_image_type === 'data_url'
+      && t.input_image_mime === 'image/png'
+      && t.input_image_sha256_short === 'abcd1234';
+    recordResult(
+      'GET /api/tasks I2V Success seed -> generation_mode=image_to_video + safe payload',
+      ok,
+      `mode=${t?.generation_mode} status=${t?.status} file_id_present=${Boolean(t?.file_id)}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/tasks I2V Success seed', false, err.message);
+  }
+
+  // 41. Phase I: GET /api/generation-modes -> 200 with both modes
+  try {
+    const r = await fetch(`${base}/api/generation-modes`);
+    const body = await r.json().catch(() => ({}));
+    const ok = r.status === 200
+      && Array.isArray(body.modes)
+      && body.modes.includes('text_to_video')
+      && body.modes.includes('image_to_video')
+      && body.defaults
+      && body.defaults.image_to_video
+      && body.image_constraints;
+    recordResult(
+      'GET /api/generation-modes -> 200 with text_to_video + image_to_video + image_constraints',
+      ok,
+      `status=${r.status} modes=${(body.modes || []).join(',')}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/generation-modes', false, err.message);
+  }
+
+  // 42. Phase I: GET /api/video/i2v/models -> 200 with I2V matrix
+  try {
+    const r = await fetch(`${base}/api/video/i2v/models`);
+    const body = await r.json().catch(() => ({}));
+    const ok = r.status === 200
+      && body.compatibility
+      && body.compatibility['MiniMax-Hailuo-2.3']
+      && body.image_constraints
+      && body.image_constraints.max_bytes === 20 * 1024 * 1024;
+    recordResult(
+      'GET /api/video/i2v/models -> 200 with MiniMax-Hailuo-2.3 matrix and 20MB cap',
+      ok,
+      `status=${r.status} has_matrix=${Boolean(body?.compatibility?.['MiniMax-Hailuo-2.3'])}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/video/i2v/models', false, err.message);
+  }
+
+  // 43. Phase I: smoke:i2v dry-run does NOT call MiniMax
+  //   The script only emits console summary under default mode and
+  //   writes reports/local/i2v-smoke-dry-run.local.{md,json}. It never
+  //   touches docs/PHASE_A_API_SMOKE_REPORT.md and never creates
+  //   a real task.
+  try {
+    const publicReport = path.resolve(ROOT, 'docs', 'PHASE_A_API_SMOKE_REPORT.md');
+    const before = fs.readFileSync(publicReport, 'utf8');
+    const beforeMtime = fs.statSync(publicReport).mtimeMs;
+    const smoke = spawn(process.execPath, [path.resolve(ROOT, 'scripts', 'smoke-image-to-video.js')], {
+      cwd: ROOT,
+      env: { ...process.env, PORT: '0', NODE_ENV: 'test' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let smokeOut = '';
+    smoke.stdout.on('data', (c) => { smokeOut += c.toString(); });
+    smoke.stderr.on('data', (c) => { smokeOut += c.toString(); });
+    await new Promise((resolve) => smoke.on('exit', resolve));
+    const after = fs.readFileSync(publicReport, 'utf8');
+    const afterMtime = fs.statSync(publicReport).mtimeMs;
+    const unchanged = before === after && beforeMtime === afterMtime;
+    const noI2VTask = !/MiniMax I2V created/.test(serverStderr);
+    recordResult(
+      'smoke:i2v dry-run leaves docs/PHASE_A_API_SMOKE_REPORT.md untouched',
+      unchanged,
+      unchanged ? 'content and mtime identical' : 'mtime or content changed',
+    );
+    recordResult(
+      'smoke:i2v dry-run did not create a real I2V task',
+      noI2VTask,
+      noI2VTask ? 'no remote call observed' : 'unexpected MiniMax trace',
+    );
+    if (smokeOut.includes('MINIMAX_API_KEY: repl') || smokeOut.includes('eyJ')) {
+      recordResult('smoke:i2v dry-run output does not echo real key fragment', false, 'dry-run output contained a real key fragment');
+    } else {
+      recordResult('smoke:i2v dry-run output does not echo real key fragment', true, 'no real key fragment in dry-run output');
+    }
+  } catch (err) {
+    recordResult('smoke:i2v dry-run hygiene', false, err.message);
+  }
 }
 
 async function main() {
@@ -823,28 +1269,33 @@ async function main() {
     // ignore
   }
 
-  logLine(`[phase-h] check:api starting on port ${PORT}`);
+  logLine(`[phase-i] check:api starting on port ${PORT}`);
 
   if (process.env.CONFIRM_REAL_VIDEO === '1') {
-    logLine('[phase-h] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
+    logLine('[phase-i] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
+    process.exitCode = 2;
+    return;
+  }
+  if (process.env.CONFIRM_REAL_I2V === '1') {
+    logLine('[phase-i] aborting: CONFIRM_REAL_I2V=1 is not allowed in check:api');
     process.exitCode = 2;
     return;
   }
 
   try {
     await seedFixtures();
-    logLine('[phase-h] local SQLite fixtures seeded (offline, fake ids)');
+    logLine('[phase-i] local SQLite fixtures seeded (offline, fake ids)');
   } catch (err) {
-    logLine(`[phase-h] failed to seed fixtures: ${err.message}`);
+    logLine(`[phase-i] failed to seed fixtures: ${err.message}`);
     process.exitCode = 1;
     return;
   }
 
   try {
     await startServer();
-    logLine(`[phase-h] server up on :${PORT}`);
+    logLine(`[phase-i] server up on :${PORT}`);
   } catch (err) {
-    logLine(`[phase-h] failed to start server: ${err.message}`);
+    logLine(`[phase-i] failed to start server: ${err.message}`);
     process.exitCode = 1;
     return;
   }
@@ -857,18 +1308,18 @@ async function main() {
 
   const passed = checks.filter((c) => c.ok).length;
   const failed = checks.length - passed;
-  logLine(`[phase-h] summary: ${passed}/${checks.length} checks passed`);
+  logLine(`[phase-i] summary: ${passed}/${checks.length} checks passed`);
   if (failed > 0) {
-    logLine(`[phase-h] FAILED checks:`);
+    logLine(`[phase-i] FAILED checks:`);
     checks.filter((c) => !c.ok).forEach((c) => logLine(`  - ${c.name}: ${c.detail || ''}`));
     process.exitCode = 1;
   } else {
-    logLine(`[phase-h] all checks PASSED. No real MiniMax task was created.`);
+    logLine(`[phase-i] all checks PASSED. No real MiniMax task was created.`);
   }
 }
 
 main().catch((err) => {
-  logLine(`[phase-h] unexpected error: ${err && err.message ? err.message : err}`);
+  logLine(`[phase-i] unexpected error: ${err && err.message ? err.message : err}`);
   stopServer();
   process.exitCode = 1;
 });

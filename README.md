@@ -530,6 +530,127 @@ quota.
 - `POST /api/video/create` returns recommendation text on reject.
 - Frontend blocks unsupported combinations before submit.
 
+## Image-to-Video Foundation (Phase I Recovery)
+
+Phase I lays the **code + contract** groundwork for image-to-video. It does
+**not** run a real I2V task against MiniMax in this release.
+
+### `generation_mode`
+
+`POST /api/video/create` now accepts a `generation_mode` field:
+
+| Value | Meaning |
+| --- | --- |
+| `text_to_video` (default) | text → video, same as before |
+| `image_to_video` | image (first frame) → video, requires `first_frame_image` |
+
+If `image_to_video` is sent without `first_frame_image`, the server
+returns HTTP 400 *before* any remote call.
+
+### First-frame image inputs
+
+Two input shapes are accepted:
+
+1. **Public HTTPS URL** — e.g. `https://cdn.example.com/first-frame.jpg`.
+   The server parses the URL, rejects `http://`, `localhost`, RFC1918
+   private ranges, `0.0.0.0`, and `file://` URLs.
+2. **Data URL** — `data:image/jpeg|png|webp;base64,...`. Built in the
+   browser by `FileReader.readAsDataURL` from a local upload, or pasted
+   manually. The server only accepts `image/jpeg`, `image/png`,
+   `image/webp` and rejects everything else.
+
+The **bytes** of `first_frame_image` are forwarded to MiniMax as part of
+the I2V request and are **never persisted**:
+
+- `data:image/...;base64,...` is **never** written to SQLite, JSON
+  reports, README, or any committed file.
+- Server stores only a *summary*: `input_image_present`,
+  `input_image_type` (`public_url` / `data_url`), `input_image_host`,
+  `input_image_mime`, `input_image_approx_bytes`,
+  `input_image_sha256_short` (first 8 hex chars of SHA-256 of the raw
+  value), `input_image_summary`.
+- Frontend never restores the image when filling a task back into the
+  form — it tells the user to re-pick / re-paste the first frame.
+
+### Image constraints
+
+| Constraint | Limit |
+| --- | --- |
+| Allowed MIME types | `image/jpeg`, `image/png`, `image/webp` |
+| Max size | 20 MB (≈ 20,971,520 bytes) |
+| Min short side | 300 px |
+| Aspect ratio | long / short ∈ [0.4, 2.5] (≈ 2:5 to 5:2) |
+
+These are enforced in two places:
+
+- `server/services/validation.js` → `validateImageInput`,
+  `validateImageToVideoInput`.
+- `web/src/App.jsx` → `inspectImageFile` (runs before submit; greys out
+  Submit until the image passes all four rules).
+
+### I2V parameter matrix
+
+The I2V model list is sourced from `shared/videoModelsI2V.json`
+(wrapped under `i2vModelConfig`) and exposed at
+`GET /api/video/i2v/models`. Current contents:
+
+- `MiniMax-Hailuo-2.3`
+  - `6s`: `768P`, `1080P`
+  - `10s`: `768P`
+- `MiniMax-Hailuo-2.3-Fast`
+  - `6s`: `768P`, `1080P`
+  - `10s`: `768P`
+- `MiniMax-Hailuo-02`
+  - `6s`: `512P`, `768P`, `1080P`
+  - `10s`: `512P`, `768P`
+- `I2V-01-Director`
+  - `6s`: `720P`
+- `I2V-01-live`
+  - `6s`: `720P`
+- `I2V-01`
+  - `6s`: `720P`
+
+Defaults: model `MiniMax-Hailuo-2.3`, duration `6`, resolution `768P`,
+`prompt_optimizer: true`. The frontend always pulls the live matrix from
+`/api/video/i2v/models`; the in-source `FALLBACK_I2V_CONFIG` is only used
+if the API call fails.
+
+### Image-related error categories
+
+`server/services/errorClassifier.js` now recognizes image-specific
+failure modes returned by MiniMax / the validator:
+
+| `error_category` | Meaning |
+| --- | --- |
+| `image_unavailable` | MiniMax cannot fetch the image URL |
+| `image_too_large` | image exceeds the size cap |
+| `unsupported_image_format` | image is not JPG/JPEG/PNG/WebP |
+| `invalid_image_dimensions` | short side < 300 px or aspect ratio out of range |
+
+These surface as the existing `error_category` /
+`error_user_message` / `error_suggested_action` fields in task
+responses and in the detail panel.
+
+### What was *not* done in Phase I Recovery
+
+- **No real I2V smoke was executed.** `npm run smoke:i2v` is a dry-run
+  only. To run one real I2V job you must explicitly opt in by setting
+  `CONFIRM_REAL_VIDEO=1` *and* `CONFIRM_REAL_I2V=1` in the same shell
+  — and even then, the project deliberately refuses to consume quota
+  unless the user authorizes Phase J.
+- **A real I2V smoke test would consume MiniMax quota.** Treat any
+  real call as production traffic.
+- **No image bytes are committed.** No task_id, file_id, download_url,
+  image URL, or base64 image content from a real MiniMax run is
+  present anywhere in `server/`, `web/`, `scripts/`, `shared/`, `docs/`
+  or `README.md`.
+
+### Phase J (next, gated)
+
+Phase J would run **one** controlled real I2V smoke job end-to-end. It
+is intentionally not part of this release and will only run after
+explicit user authorization.
+
 ## Task status
 
 - Preparing: `Preparing`

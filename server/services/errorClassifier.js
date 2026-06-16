@@ -24,6 +24,10 @@ const CATEGORIES = {
   SERVER_ERROR: 'server_error',
   NETWORK: 'network',
   TIMEOUT: 'timeout',
+  IMAGE_UNAVAILABLE: 'image_unavailable',
+  IMAGE_TOO_LARGE: 'image_too_large',
+  UNSUPPORTED_IMAGE_FORMAT: 'unsupported_image_format',
+  INVALID_IMAGE_DIMENSIONS: 'invalid_image_dimensions',
   UNKNOWN: 'unknown',
 };
 
@@ -105,6 +109,38 @@ const TIMEOUT_PATTERNS = [
   /超时/,
 ];
 
+// Phase I Recovery - image-related error categories. These match
+// fail_reason / status_msg / message text from MiniMax I2V failures.
+const IMAGE_UNAVAILABLE_PATTERNS = [
+  /image\s+url\s+unavailable/i,
+  /failed\s+to\s+download\s+image/i,
+  /image\s+inaccessible/i,
+  /image\s+not\s+found/i,
+  /image\s+fetch\s+failed/i,
+];
+
+const IMAGE_TOO_LARGE_PATTERNS = [
+  /image\s+too\s+large/i,
+  /exceeds?\s+20\s*mb/i,
+  /file\s+too\s+large/i,
+  /payload\s+too\s+large/i,
+];
+
+const UNSUPPORTED_IMAGE_FORMAT_PATTERNS = [
+  /unsupported\s+image\s+format/i,
+  /invalid\s+image\s+type/i,
+  /not\s+(?:a\s+)?(?:jpg|jpeg|png|webp)/i,
+  /unsupported\s+mime/i,
+];
+
+const INVALID_IMAGE_DIMENSIONS_PATTERNS = [
+  /image\s+dimension/i,
+  /\bshort\s+side\b/i,
+  /\baspect\s+ratio\b/i,
+  /\btoo\s+small\b/i,
+  /invalid\s+ratio/i,
+];
+
 function normalizeText(value) {
   if (value === undefined || value === null) return '';
   return String(value).trim();
@@ -176,6 +212,38 @@ function defaultFor(category) {
         can_retry: true,
         retry_hint: '不要自动重新生成；先刷新状态确认是否已经完成。',
       };
+    case CATEGORIES.IMAGE_UNAVAILABLE:
+      return {
+        severity: SEVERITY.WARNING,
+        user_message: 'MiniMax 拉取首帧图片失败：图片不可访问或已失效。',
+        suggested_action: '换一张可公网访问的图片（https URL），或重新上传本地图片后再次提交。',
+        can_retry: true,
+        retry_hint: '重新提交会消耗额度；先确认图片 URL 公开可访问。',
+      };
+    case CATEGORIES.IMAGE_TOO_LARGE:
+      return {
+        severity: SEVERITY.WARNING,
+        user_message: '首帧图片超过 20MB 限制。',
+        suggested_action: '将图片压缩到 20MB 以下后再重新提交。',
+        can_retry: true,
+        retry_hint: '重新提交会消耗额度；先压缩图片。',
+      };
+    case CATEGORIES.UNSUPPORTED_IMAGE_FORMAT:
+      return {
+        severity: SEVERITY.WARNING,
+        user_message: '首帧图片格式不被支持。',
+        suggested_action: '将图片转换为 JPG / PNG / WebP 之一后再重新提交。',
+        can_retry: true,
+        retry_hint: '重新提交会消耗额度；先转换格式。',
+      };
+    case CATEGORIES.INVALID_IMAGE_DIMENSIONS:
+      return {
+        severity: SEVERITY.WARNING,
+        user_message: '首帧图片尺寸或长宽比不符合 MiniMax 要求。',
+        suggested_action: '调整图片短边大于 300px、长宽比在 2:5 到 5:2 之间后重新提交。',
+        can_retry: true,
+        retry_hint: '重新提交会消耗额度；先调整图片尺寸。',
+      };
     case CATEGORIES.UNKNOWN:
     default:
       return {
@@ -213,6 +281,14 @@ function classifyVideoError(input) {
     category = CATEGORIES.RATE_LIMIT;
   } else if (anyMatch(AUTH_PATTERNS, haystack)) {
     category = CATEGORIES.AUTH;
+  } else if (anyMatch(IMAGE_UNAVAILABLE_PATTERNS, haystack)) {
+    category = CATEGORIES.IMAGE_UNAVAILABLE;
+  } else if (anyMatch(IMAGE_TOO_LARGE_PATTERNS, haystack)) {
+    category = CATEGORIES.IMAGE_TOO_LARGE;
+  } else if (anyMatch(UNSUPPORTED_IMAGE_FORMAT_PATTERNS, haystack)) {
+    category = CATEGORIES.UNSUPPORTED_IMAGE_FORMAT;
+  } else if (anyMatch(INVALID_IMAGE_DIMENSIONS_PATTERNS, haystack)) {
+    category = CATEGORIES.INVALID_IMAGE_DIMENSIONS;
   } else if (anyMatch(INVALID_PARAMS_PATTERNS, haystack)) {
     category = CATEGORIES.INVALID_PARAMS;
   } else if (anyMatch(SERVER_ERROR_PATTERNS, haystack)) {

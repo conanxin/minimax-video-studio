@@ -15,16 +15,21 @@ const {
   normalizeMiniMaxStatus,
   validateTaskInput,
   modelConfig,
+  i2vModelConfig,
 } = require('./services/taskStore');
 const {
   createTextToVideo,
+  createImageToVideo,
   queryVideoTask,
   retrieveVideoFile,
 } = require('./services/minimaxClient');
+const { toSafeTaskPayload } = require('./services/taskTransform');
+const { validateImageInput } = require('./services/validation');
 const pollingConfig = require('../shared/pollingConfig.json');
 const freshness = require('./services/downloadLinkFreshness');
 const errorClassifier = require('./services/errorClassifier');
 const { toIsoNow } = require('./db');
+const crypto = require('crypto');
 
 config();
 
@@ -35,7 +40,12 @@ const FRONTEND_DIST = path.resolve(__dirname, '../web/dist');
 const INDEX_HTML = path.join(FRONTEND_DIST, 'index.html');
 
 app.use(cors());
-app.use(express.json());
+// Phase I Recovery: allow up to 50MB JSON payloads so a 20MB
+// image_to_video Data URL can reach the validator. The validator
+// itself enforces the 20MB image constraint; this only lifts the
+// transport ceiling. Without this, express returns 413 before the
+// validator ever runs.
+app.use(express.json({ limit: '50mb' }));
 app.set('trust proxy', true);
 
 app.get('/api/health', async (_req, res) => {
@@ -49,6 +59,21 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/video/models', (_req, res) => {
   res.json(modelConfig);
+});
+
+app.get('/api/video/i2v/models', (_req, res) => {
+  res.json(i2vModelConfig);
+});
+
+app.get('/api/generation-modes', (_req, res) => {
+  res.json({
+    modes: ['text_to_video', 'image_to_video'],
+    defaults: {
+      text_to_video: modelConfig.defaults,
+      image_to_video: i2vModelConfig.defaults,
+    },
+    image_constraints: i2vModelConfig.image_constraints,
+  });
 });
 
 app.get('/api/polling/config', (_req, res) => {
@@ -98,39 +123,29 @@ function normalizeTaskPayload(req) {
     duration: req.body?.duration || modelConfig.defaults.duration,
     resolution: req.body?.resolution || modelConfig.defaults.resolution,
     prompt_optimizer: req.body?.prompt_optimizer !== false,
+    generation_mode: req.body?.generation_mode,
+    first_frame_image: req.body?.first_frame_image,
   };
 }
 
-function toSafeTaskPayload(task) {
-  if (!task) return null;
-  const summary = freshness.classify(task);
-  const errorInfo = errorClassifier.classifyFromTask(task);
-  return {
-    id: task.id,
-    task_id: task.task_id,
-    prompt: task.prompt,
-    model: task.model,
-    duration: Number(task.duration),
-    resolution: task.resolution,
-    prompt_optimizer: Boolean(task.prompt_optimizer),
-    status: normalizeMiniMaxStatus(task.status),
-    file_id: task.file_id,
-    download_url: task.download_url,
-    fail_reason: task.fail_reason,
-    created_at: task.created_at,
-    updated_at: task.updated_at,
-    download_url_refreshed_at: task.download_url_refreshed_at || null,
-    download_url_present: summary.download_url_present,
-    download_url_status: summary.download_url_status,
-    download_url_age_hours: summary.download_url_age_hours,
-    should_refresh_download_url: summary.should_refresh_download_url,
-    error_category: errorInfo.error_category,
-    error_severity: errorInfo.severity,
-    error_user_message: errorInfo.user_message,
-    error_suggested_action: errorInfo.suggested_action,
-    error_can_retry: errorInfo.can_retry,
-    error_retry_hint: errorInfo.retry_hint,
-  };
+// Phase I Recovery: image-to-video payload assembly. The first_frame_image
+// is consumed by the I2V validator and MiniMax client. The DB only stores
+// a safe summary (kind / host / mime / bytes / sha256_short / summary).
+function buildImageInputSummary(normalized) {
+  const value = normalized.first_frame_image || '';
+  const kind = normalized.first_frame_image_kind;
+  const sha256 = crypto
+    .createHash('sha256')
+    .update(value)
+    .digest('hex')
+    .slice(0, 8);
+  let summary = 'Image first frame recorded';
+  if (kind === 'data_url') {
+    summary = `Data URL image, mime=${normalized.first_frame_image_mime || 'unknown'}, ~${normalized.first_frame_image_approx_bytes || 0} bytes`;
+  } else if (kind === 'public_url') {
+    summary = `Public URL image, host=${normalized.first_frame_image_host || 'unknown'}`;
+  }
+  return { sha256, summary };
 }
 
 async function syncTaskById(taskId) {
@@ -180,9 +195,54 @@ app.post('/api/video/create', requirePasscode, async (req, res) => {
   const fallbackTaskId = `local-${Date.now()}`;
 
   try {
-    const remote = await createTextToVideo(payload);
+    let remote;
+    if (payload.generation_mode === 'image_to_video') {
+      const imageSummary = buildImageInputSummary(payload);
+      const dbSafeImageFields = {
+        generation_mode: 'image_to_video',
+        input_image_present: true,
+        input_image_type: payload.first_frame_image_kind,
+        input_image_host: payload.first_frame_image_host || null,
+        input_image_mime: payload.first_frame_image_mime || null,
+        input_image_approx_bytes: payload.first_frame_image_approx_bytes || null,
+        input_image_sha256_short: imageSummary.sha256,
+        input_image_summary: imageSummary.summary,
+      };
+      // Image bytes are sent to MiniMax only; never persisted.
+      remote = await createImageToVideo({
+        model: payload.model,
+        prompt: payload.prompt,
+        duration: payload.duration,
+        resolution: payload.resolution,
+        prompt_optimizer: payload.prompt_optimizer,
+        first_frame_image: payload.first_frame_image,
+      });
+      const taskId = remote.task_id || fallbackTaskId;
+      const record = await upsertTaskByTaskId(taskId, {
+        generation_mode: 'image_to_video',
+        prompt: payload.prompt,
+        model: payload.model,
+        duration: payload.duration,
+        resolution: payload.resolution,
+        prompt_optimizer: payload.prompt_optimizer,
+        status: normalizeMiniMaxStatus(remote.status) || 'Queueing',
+        file_id: remote.file_id || null,
+        download_url: remote.download_url || null,
+        fail_reason: remote.fail_reason || null,
+        ...dbSafeImageFields,
+      });
+      return res.json({
+        task_id: record.task_id,
+        status: record.status,
+        created_at: record.created_at,
+        message: 'Image-to-video task has been submitted.',
+      });
+    }
+
+    remote = await createTextToVideo(payload);
     const taskId = remote.task_id || fallbackTaskId;
     const record = await upsertTaskByTaskId(taskId, {
+      generation_mode: 'text_to_video',
       prompt: payload.prompt,
       model: payload.model,
       duration: payload.duration,
@@ -203,6 +263,7 @@ app.post('/api/video/create', requirePasscode, async (req, res) => {
   } catch (error) {
     const failTask = await createTaskRecord({
       task_id: fallbackTaskId,
+      generation_mode: payload.generation_mode || 'text_to_video',
       prompt: payload.prompt,
       model: payload.model,
       duration: payload.duration,

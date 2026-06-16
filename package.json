@@ -13,6 +13,7 @@
     "build": "vite build --config web/vite.config.js",
     "start": "node server/index.js",
     "smoke:video": "node scripts/smoke-text-to-video.js",
+    "smoke:i2v": "node scripts/smoke-image-to-video.js",
     "import:local-smoke": "node scripts/import-local-smoke-to-db.js",
     "check:api": "node scripts/check-api-regression.js",
     "check:open-source": "node scripts/check-open-source.js"

@@ -44,6 +44,8 @@ async function initDb() {
   // Phase G: additive migration for download_url freshness tracking.
   // Each ALTER is guarded with sqlite_master so legacy databases are
   // upgraded on first open without breaking older schemas.
+  // Phase I Recovery: additive migration for image-to-video fields.
+  // The full first_frame_image is intentionally NEVER persisted.
   const taskColumns = await db.all('PRAGMA table_info(tasks)');
   const haveColumn = (name) => taskColumns.some((c) => c.name === name);
   if (!haveColumn('download_url_refreshed_at')) {
@@ -51,6 +53,30 @@ async function initDb() {
   }
   if (!haveColumn('download_url_status')) {
     await db.exec("ALTER TABLE tasks ADD COLUMN download_url_status TEXT DEFAULT 'unknown'");
+  }
+  if (!haveColumn('generation_mode')) {
+    await db.exec("ALTER TABLE tasks ADD COLUMN generation_mode TEXT DEFAULT 'text_to_video'");
+  }
+  if (!haveColumn('input_image_present')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN input_image_present INTEGER DEFAULT 0');
+  }
+  if (!haveColumn('input_image_type')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN input_image_type TEXT');
+  }
+  if (!haveColumn('input_image_host')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN input_image_host TEXT');
+  }
+  if (!haveColumn('input_image_mime')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN input_image_mime TEXT');
+  }
+  if (!haveColumn('input_image_approx_bytes')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN input_image_approx_bytes INTEGER');
+  }
+  if (!haveColumn('input_image_sha256_short')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN input_image_sha256_short TEXT');
+  }
+  if (!haveColumn('input_image_summary')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN input_image_summary TEXT');
   }
 
   await db.run('CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id);');
@@ -64,13 +90,51 @@ function toIsoNow() {
   return new Date().toISOString();
 }
 
+const I2V_WRITEABLE_FIELDS = new Set([
+  'generation_mode',
+  'input_image_present',
+  'input_image_type',
+  'input_image_host',
+  'input_image_mime',
+  'input_image_approx_bytes',
+  'input_image_sha256_short',
+  'input_image_summary',
+]);
+
+const I2V_NUMERIC_FIELDS = new Set(['input_image_approx_bytes']);
+
+const I2V_BOOLEAN_FIELDS = new Set(['input_image_present']);
+
+function normalizeI2VFields(updates) {
+  if (!updates) return {};
+  const out = {};
+  for (const key of Object.keys(updates)) {
+    if (!I2V_WRITEABLE_FIELDS.has(key)) continue;
+    let value = updates[key];
+    if (I2V_BOOLEAN_FIELDS.has(key)) {
+      value = value ? 1 : 0;
+    } else if (I2V_NUMERIC_FIELDS.has(key) && value !== null && value !== undefined) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) continue;
+      value = num;
+    }
+    if (value === undefined) continue;
+    out[key] = value === null ? null : value;
+  }
+  return out;
+}
+
 async function createTask(db, record) {
   const now = toIsoNow();
+  const i2vFields = normalizeI2VFields(record);
   const result = await db.run(
     `INSERT INTO tasks (
       task_id, prompt, model, duration, resolution, prompt_optimizer,
-      status, file_id, download_url, fail_reason, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      status, file_id, download_url, fail_reason, created_at, updated_at,
+      generation_mode, input_image_present, input_image_type,
+      input_image_host, input_image_mime, input_image_approx_bytes,
+      input_image_sha256_short, input_image_summary
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       record.task_id,
       record.prompt,
@@ -84,6 +148,14 @@ async function createTask(db, record) {
       record.fail_reason || null,
       now,
       now,
+      i2vFields.generation_mode || 'text_to_video',
+      i2vFields.input_image_present !== undefined ? i2vFields.input_image_present : 0,
+      i2vFields.input_image_type || null,
+      i2vFields.input_image_host || null,
+      i2vFields.input_image_mime || null,
+      i2vFields.input_image_approx_bytes || null,
+      i2vFields.input_image_sha256_short || null,
+      i2vFields.input_image_summary || null,
     ]
   );
 
@@ -143,13 +215,15 @@ function flattenUpdates(updates) {
 }
 
 async function updateTask(db, taskId, updates) {
-  const keys = flattenUpdates(updates);
+  const i2vUpdates = normalizeI2VFields(updates);
+  const merged = { ...updates, ...i2vUpdates };
+  const keys = flattenUpdates(merged);
   if (keys.length === 0) return getTaskByTaskId(db, taskId);
 
   const assignments = keys
     .map((key) => `${key} = ?`)
     .join(', ');
-  const values = keys.map((key) => updates[key]);
+  const values = keys.map((key) => merged[key]);
 
   values.push(toIsoNow());
   values.push(taskId);
@@ -165,6 +239,11 @@ function mapTask(task) {
     ...task,
     prompt_optimizer: Boolean(task.prompt_optimizer),
     duration: Number(task.duration),
+    input_image_present: Boolean(task.input_image_present),
+    input_image_approx_bytes:
+      task.input_image_approx_bytes === null || task.input_image_approx_bytes === undefined
+        ? null
+        : Number(task.input_image_approx_bytes),
   };
 }
 

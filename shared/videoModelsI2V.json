@@ -1,0 +1,43 @@
+{
+  "i2vModelConfig": {
+    "defaults": {
+      "model": "MiniMax-Hailuo-2.3",
+      "duration": 6,
+      "resolution": "768P",
+      "prompt_optimizer": true
+    },
+    "max_prompt_length": 2000,
+    "image_constraints": {
+      "formats": ["jpg", "jpeg", "png", "webp"],
+      "max_bytes": 20971520,
+      "min_short_side_px": 300,
+      "aspect_ratio_min": 0.4,
+      "aspect_ratio_max": 2.5,
+      "input_types": ["public_url", "data_url"]
+    },
+    "compatibility": {
+      "MiniMax-Hailuo-2.3": {
+        "6": ["768P", "1080P"],
+        "10": ["768P"]
+      },
+      "MiniMax-Hailuo-2.3-Fast": {
+        "6": ["768P", "1080P"],
+        "10": ["768P"]
+      },
+      "MiniMax-Hailuo-02": {
+        "6": ["512P", "768P", "1080P"],
+        "10": ["512P", "768P"]
+      },
+      "I2V-01-Director": {
+        "6": ["720P"]
+      },
+      "I2V-01-live": {
+        "6": ["720P"]
+      },
+      "I2V-01": {
+        "6": ["720P"]
+      }
+    }
+  },
+  "_comment": "Wrapper field is `i2vModelConfig` so `require('./shared/videoModelsI2V.json').i2vModelConfig` matches the pattern already used for `videoModels.json` -> `modelConfig` in the rest of the project. Added in Phase I Recovery."
+}

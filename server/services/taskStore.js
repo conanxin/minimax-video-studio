@@ -9,6 +9,10 @@ const {
   mapTask,
 } = require('../db');
 const modelConfig = require('../../shared/videoModels.json');
+const {
+  validateTaskInput: sharedValidateTaskInput,
+  ALLOWED_GENERATION_MODES,
+} = require('./validation');
 
 let dbPromise = null;
 
@@ -64,56 +68,21 @@ function supportedCombinationHint(model) {
 }
 
 function validateTaskInput(payload) {
-  const { model, duration, resolution, prompt, prompt_optimizer } = payload;
-
-  if (!prompt || String(prompt).trim().length === 0) {
-    return { ok: false, error: 'Prompt is required.' };
-  }
-  if (String(prompt).length > modelConfig.max_prompt_length) {
+  // Phase I Recovery: text_to_video / image_to_video are both
+  // validated by the shared `validation.js` module. This thin
+  // wrapper preserves the original return shape so callers in
+  // server/index.js continue to receive { ok, normalized, error, hint }.
+  const result = sharedValidateTaskInput(payload || {});
+  if (result.ok) {
     return {
-      ok: false,
-      error: `Prompt must be no more than ${modelConfig.max_prompt_length} characters.`,
+      ok: true,
+      normalized: result.normalized,
     };
   }
-  if (!isValidModel(model)) {
-    return {
-      ok: false,
-      error: 'Unsupported model.',
-      hint: `Allowed: ${Object.keys(modelConfig.compatibility).join(' / ')}`,
-    };
-  }
-
-  const normalizedDuration = Number(duration);
-  if (!Number.isInteger(normalizedDuration) || normalizedDuration <= 0) {
-    return { ok: false, error: 'Duration must be a positive integer.' };
-  }
-
-  const durations = supportedResolutions(model, normalizedDuration);
-  if (!durations || durations.length === 0) {
-    return {
-      ok: false,
-      error: `${model} does not support duration ${normalizedDuration}s.`,
-      hint: supportedCombinationHint(model),
-    };
-  }
-
-  if (!isSupportedCombination(model, normalizedDuration, String(resolution))) {
-    return {
-      ok: false,
-      error: `${model} does not support ${normalizedDuration}s + ${resolution}.`,
-      hint: supportedCombinationHint(model),
-    };
-  }
-
   return {
-    ok: true,
-    normalized: {
-      model,
-      duration: normalizedDuration,
-      resolution: String(resolution),
-      prompt: String(prompt).trim(),
-      prompt_optimizer: prompt_optimizer !== false,
-    },
+    ok: false,
+    error: result.error,
+    hint: result.hint,
   };
 }
 
@@ -177,6 +146,8 @@ async function countFilteredTasks({ status = null, q = null } = {}) {
 
 module.exports = {
   modelConfig,
+  i2vModelConfig: require('../../shared/videoModelsI2V.json').i2vModelConfig,
+  allowedGenerationModes: ALLOWED_GENERATION_MODES,
   normalizeMiniMaxStatus,
   supportedDurations,
   supportedResolutions,

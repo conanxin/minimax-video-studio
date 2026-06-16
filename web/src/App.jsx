@@ -36,6 +36,58 @@ const FALLBACK_MODEL_CONFIG = {
   },
 };
 
+// Frontend I2V fallback. The authoritative copy lives at
+// /api/video/i2v/models; this constant is only used when the network call
+// fails so the UI still knows the basic constraints.
+const FALLBACK_I2V_CONFIG = {
+  defaults: {
+    model: 'MiniMax-Hailuo-2.3',
+    duration: 6,
+    resolution: '768P',
+    prompt_optimizer: true,
+  },
+  max_prompt_length: 2000,
+  image_constraints: {
+    formats: ['jpg', 'jpeg', 'png', 'webp'],
+    max_bytes: 20971520,
+    min_short_side_px: 300,
+    aspect_ratio_min: 0.4,
+    aspect_ratio_max: 2.5,
+    input_types: ['public_url', 'data_url'],
+  },
+  compatibility: {
+    'MiniMax-Hailuo-2.3': { '6': ['768P', '1080P'], '10': ['768P'] },
+    'MiniMax-Hailuo-2.3-Fast': { '6': ['768P', '1080P'], '10': ['768P'] },
+    'MiniMax-Hailuo-02': { '6': ['512P', '768P', '1080P'], '10': ['512P', '768P'] },
+    'I2V-01-Director': { '6': ['720P'] },
+    'I2V-01-live': { '6': ['720P'] },
+    'I2V-01': { '6': ['720P'] },
+  },
+};
+
+const GENERATION_MODE_OPTIONS = [
+  { value: 'text_to_video', label: '文生视频' },
+  { value: 'image_to_video', label: '图生视频' },
+];
+
+const GENERATION_MODE_LABEL = {
+  text_to_video: '文生视频',
+  image_to_video: '图生视频',
+};
+
+const I2V_FORMAT_LABELS = {
+  'image/jpeg': 'JPG/JPEG',
+  'image/png': 'PNG',
+  'image/webp': 'WebP',
+};
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '-';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
 const STATUS_TEXT = {
   Preparing: '准备中',
   Queueing: '排队中',
@@ -215,15 +267,154 @@ function pickPollingConfig(remote) {
   };
 }
 
+// Inspect an image file (FileReader -> Data URL + Image element) and
+// return a Promise with a structured result. Always resolves; never
+// rejects. Callers should treat ok=false as a soft validation failure
+// (grey out submit, show the reason).
+function inspectImageFile(file) {
+  return new Promise((resolve) => {
+    if (!file) {
+      resolve({ ok: false, reason: 'no_file', error: 'No file provided.' });
+      return;
+    }
+    const mime = (file.type || '').toLowerCase();
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(mime)) {
+      resolve({
+        ok: false,
+        reason: 'unsupported_mime',
+        error: `Unsupported image type: ${mime || 'unknown'}. Allowed: JPG/JPEG, PNG, WebP.`,
+      });
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      resolve({
+        ok: false,
+        reason: 'too_large',
+        error: `Image is too large: ${formatBytes(file.size)} > 20 MB.`,
+      });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => {
+      resolve({ ok: false, reason: 'read_error', error: 'Failed to read the image file.' });
+    };
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      const img = new Image();
+      img.onerror = () => {
+        resolve({
+          ok: false,
+          reason: 'decode_error',
+          error: 'Could not decode the image. Try a different file.',
+        });
+      };
+      img.onload = () => {
+        const width = img.naturalWidth || img.width;
+        const height = img.naturalHeight || img.height;
+        const shortSide = Math.min(width, height);
+        const longSide = Math.max(width, height);
+        const ratio = height > 0 && width > 0 ? longSide / shortSide : 0;
+        const minShort = FALLBACK_I2V_CONFIG.image_constraints.min_short_side_px;
+        const ratioMin = FALLBACK_I2V_CONFIG.image_constraints.aspect_ratio_min;
+        const ratioMax = FALLBACK_I2V_CONFIG.image_constraints.aspect_ratio_max;
+        if (shortSide < minShort) {
+          resolve({
+            ok: false,
+            reason: 'too_small',
+            error: `Image short side is ${shortSide}px; must be at least ${minShort}px.`,
+            dataUrl,
+            width,
+            height,
+            mime,
+            sizeBytes: file.size,
+          });
+          return;
+        }
+        if (ratio < ratioMin || ratio > ratioMax) {
+          resolve({
+            ok: false,
+            reason: 'bad_aspect',
+            error: `Aspect ratio ${ratio.toFixed(2)} outside 2:5 to 5:2 (${ratioMin}–${ratioMax}).`,
+            dataUrl,
+            width,
+            height,
+            mime,
+            sizeBytes: file.size,
+          });
+          return;
+        }
+        resolve({
+          ok: true,
+          dataUrl,
+          width,
+          height,
+          mime,
+          sizeBytes: file.size,
+          ratio,
+        });
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function validateImageUrlInput(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return { ok: false, error: 'first_frame_image is required for image_to_video.' };
+  if (/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(raw)) {
+    return { ok: true, kind: 'data_url', source: raw };
+  }
+  if (/^https:\/\//i.test(raw)) {
+    try {
+      const u = new URL(raw);
+      if (u.protocol.toLowerCase() !== 'https:') {
+        return { ok: false, error: 'Only https:// public URLs are allowed.' };
+      }
+      const host = u.hostname || '';
+      if (
+        host === 'localhost' ||
+        /^127\./.test(host) ||
+        /^10\./.test(host) ||
+        /^192\.168\./.test(host) ||
+        /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
+        host === '0.0.0.0'
+      ) {
+        return { ok: false, error: 'Private or localhost URLs are not allowed.' };
+      }
+      return { ok: true, kind: 'public_url', host, source: raw };
+    } catch (_err) {
+      return { ok: false, error: 'Invalid URL format.' };
+    }
+  }
+  if (/^data:image\//i.test(raw)) {
+    return { ok: false, error: 'Unsupported Data URL image format. Allowed: JPG/JPEG, PNG, WebP.' };
+  }
+  if (/^http:\/\//i.test(raw)) {
+    return { ok: false, error: 'http:// URLs are not allowed. Use https://.' };
+  }
+  if (/^file:\/\//i.test(raw)) {
+    return { ok: false, error: 'file:// URLs are not allowed. Upload the image instead.' };
+  }
+  return { ok: false, error: 'Provide an https:// URL or upload an image.' };
+}
+
 export default function App() {
   const [modelConfig, setModelConfig] = useState(FALLBACK_MODEL_CONFIG);
+  const [i2vConfig, setI2vConfig] = useState(FALLBACK_I2V_CONFIG);
   const [pollingConfig, setPollingConfig] = useState(FALLBACK_POLLING_CONFIG);
   const [passcode, setPasscode] = useState('');
+  const [generationMode, setGenerationMode] = useState('text_to_video');
   const [prompt, setPrompt] = useState('');
   const [model, setModel] = useState(FALLBACK_MODEL_CONFIG.defaults.model);
   const [duration, setDuration] = useState(FALLBACK_MODEL_CONFIG.defaults.duration);
   const [resolution, setResolution] = useState(FALLBACK_MODEL_CONFIG.defaults.resolution);
   const [promptOptimizer, setPromptOptimizer] = useState(true);
+  const [imageUrlInput, setImageUrlInput] = useState('');
+  const [uploadPreview, setUploadPreview] = useState(null); // { dataUrl, width, height, mime, sizeBytes, ratio }
+  const [uploadError, setUploadError] = useState('');
+  const [urlCheckError, setUrlCheckError] = useState('');
+  const [imageBusy, setImageBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -244,16 +435,31 @@ export default function App() {
   const pollingStartedAt = useRef(null);
   const pollingAttempt = useRef(0);
   const pollingTaskId = useRef(null);
+  const fileInputRef = useRef(null);
 
-  const models = useMemo(() => buildModelList(modelConfig), [modelConfig]);
-  const durations = useMemo(() => getDurations(modelConfig, model), [modelConfig, model]);
-  const resolutions = useMemo(() => getResolutionOptions(modelConfig, model, duration), [modelConfig, model, duration]);
+  const isI2V = generationMode === 'image_to_video';
+  // T2V matrix drives model/duration/resolution when in T2V mode.
+  // I2V matrix drives the same controls in image_to_video mode.
+  const activeConfig = isI2V ? i2vConfig : modelConfig;
+  const models = useMemo(() => buildModelList(activeConfig), [activeConfig]);
+  const durations = useMemo(() => getDurations(activeConfig, model), [activeConfig, model]);
+  const resolutions = useMemo(() => getResolutionOptions(activeConfig, model, duration), [activeConfig, model, duration]);
 
-  const maxPromptLength = modelConfig.max_prompt_length || FALLBACK_MODEL_CONFIG.max_prompt_length;
+  const maxPromptLength = activeConfig.max_prompt_length || FALLBACK_MODEL_CONFIG.max_prompt_length;
   const promptLength = prompt.length;
   const isPromptTooLong = promptLength > maxPromptLength;
   const comboSupported = resolutions.includes(resolution) && durations.includes(duration);
-  const comboHint = comboSupported ? '' : supportHint(modelConfig, model, duration);
+  const comboHint = comboSupported ? '' : supportHint(activeConfig, model, duration);
+
+  // I2V image-source state. Either a public https URL or an uploaded Data URL.
+  const imageUrlCheck = useMemo(
+    () => (isI2V ? validateImageUrlInput(imageUrlInput) : { ok: true }),
+    [imageUrlInput, isI2V],
+  );
+  const hasImage = isI2V
+    ? (uploadPreview?.dataUrl ? true : Boolean(imageUrlCheck.ok && imageUrlInput.trim()))
+    : true;
+  const imageReady = !isI2V || hasImage;
 
   useEffect(() => {
     async function loadConfig() {
@@ -265,6 +471,20 @@ export default function App() {
       }
     }
     loadConfig();
+  }, []);
+
+  useEffect(() => {
+    async function loadI2vConfig() {
+      try {
+        const cfg = await requestJson('/api/video/i2v/models', { method: 'GET' }, false);
+        if (cfg && cfg.compatibility) {
+          setI2vConfig({ ...FALLBACK_I2V_CONFIG, ...cfg });
+        }
+      } catch {
+        setI2vConfig(FALLBACK_I2V_CONFIG);
+      }
+    }
+    loadI2vConfig();
   }, []);
 
   useEffect(() => {
@@ -281,15 +501,15 @@ export default function App() {
 
   useEffect(() => {
     if (!durations.includes(duration)) {
-      setDuration(durations[0] || FALLBACK_MODEL_CONFIG.defaults.duration);
+      setDuration(durations[0] || activeConfig.defaults.duration);
     }
-  }, [model, durations, duration]);
+  }, [model, durations, duration, activeConfig]);
 
   useEffect(() => {
     if (!resolutions.includes(resolution)) {
-      setResolution(resolutions[0] || FALLBACK_MODEL_CONFIG.defaults.resolution);
+      setResolution(resolutions[0] || activeConfig.defaults.resolution);
     }
-  }, [duration, durations, model, resolutions, resolution, modelConfig]);
+  }, [duration, durations, model, resolutions, resolution, activeConfig]);
 
   useEffect(() => {
     if (!passcode) return;
@@ -311,6 +531,65 @@ export default function App() {
       }
     };
   }, []);
+
+  // When the user switches modes, reset model/duration/resolution to the
+  // new matrix defaults so the dropdowns stay sensible.
+  function handleModeChange(nextMode) {
+    if (nextMode === generationMode) return;
+    setGenerationMode(nextMode);
+    const cfg = nextMode === 'image_to_video' ? i2vConfig : modelConfig;
+    const defaultModel = cfg?.defaults?.model || FALLBACK_MODEL_CONFIG.defaults.model;
+    setModel(defaultModel);
+    setDuration(cfg?.defaults?.duration || FALLBACK_MODEL_CONFIG.defaults.duration);
+    setResolution(cfg?.defaults?.resolution || FALLBACK_MODEL_CONFIG.defaults.resolution);
+    if (nextMode === 'text_to_video') {
+      setUploadPreview(null);
+      setUploadError('');
+      setUrlCheckError('');
+      setImageUrlInput('');
+    }
+  }
+
+  async function handleImageFile(file) {
+    if (!file) return;
+    setImageBusy(true);
+    setUploadError('');
+    const result = await inspectImageFile(file);
+    setImageBusy(false);
+    if (!result.ok) {
+      setUploadError(result.error || 'Image validation failed.');
+      setUploadPreview(null);
+      return;
+    }
+    setUploadPreview({
+      dataUrl: result.dataUrl,
+      width: result.width,
+      height: result.height,
+      mime: result.mime,
+      sizeBytes: result.sizeBytes,
+      ratio: result.ratio,
+    });
+    setUrlCheckError('');
+    setInfo(`已上传首帧图片（${result.width}×${result.height}，${formatBytes(result.sizeBytes)}）`);
+  }
+
+  function handleImageUrlChange(value) {
+    setImageUrlInput(value);
+    setUploadPreview(null);
+    setUploadError('');
+    if (!value.trim()) {
+      setUrlCheckError('');
+      return;
+    }
+    const check = validateImageUrlInput(value);
+    setUrlCheckError(check.ok ? '' : check.error);
+  }
+
+  function clearUploadedImage() {
+    setUploadPreview(null);
+    setUploadError('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }
 
   function buildQueryString(base, params) {
     const url = new URL(base, window.location.origin);
@@ -450,12 +729,14 @@ export default function App() {
   async function copyParamsToClipboard(task) {
     if (!task) return;
     const payload = {
+      generation_mode: task.generation_mode || 'text_to_video',
       prompt: task.prompt || '',
       model: task.model || FALLBACK_MODEL_CONFIG.defaults.model,
       duration: Number(task.duration) || FALLBACK_MODEL_CONFIG.defaults.duration,
       resolution: task.resolution || FALLBACK_MODEL_CONFIG.defaults.resolution,
       prompt_optimizer: task.prompt_optimizer !== false,
     };
+    // Never include image bytes/URLs in the exported params.
     const ok = await copyTextToClipboard(JSON.stringify(payload, null, 2));
     setInfo(ok ? '任务参数 JSON 已复制到剪贴板。' : '复制失败，请手动复制。');
     setError('');
@@ -573,24 +854,54 @@ export default function App() {
       return;
     }
 
+    if (!imageReady) {
+      setError(
+        isI2V
+          ? 'Provide a valid first-frame image (https URL or upload a JPG/PNG/WebP under 20MB).'
+          : 'Image is required.',
+      );
+      return;
+    }
+
+    let firstFrameImage = null;
+    if (isI2V) {
+      if (uploadPreview?.dataUrl) {
+        firstFrameImage = uploadPreview.dataUrl;
+      } else if (imageUrlCheck.ok && imageUrlInput.trim()) {
+        firstFrameImage = imageUrlInput.trim();
+      } else {
+        setError(imageUrlCheck.error || 'first_frame_image is required for image_to_video.');
+        return;
+      }
+    }
+
     setLoading(true);
     try {
+      const submitBody = {
+        generation_mode: generationMode,
+        prompt: prompt.trim(),
+        model,
+        duration,
+        resolution,
+        prompt_optimizer: promptOptimizer,
+      };
+      if (firstFrameImage) submitBody.first_frame_image = firstFrameImage;
+
       const result = await requestJson('/api/video/create', {
         method: 'POST',
-        body: JSON.stringify({
-          prompt: prompt.trim(),
-          model,
-          duration,
-          resolution,
-          prompt_optimizer: promptOptimizer,
-        }),
+        body: JSON.stringify(submitBody),
       });
 
       const safeTask = {
         ...result,
         status: normalizeStatus(result.status || 'Queueing'),
+        generation_mode: generationMode,
       };
-      setMessage(`Task submitted. Task ID: ${shortTaskId(safeTask.task_id)}. Note: a real submission consumes MiniMax quota.`);
+      setMessage(
+        isI2V
+          ? `Image-to-video task submitted. Task ID: ${shortTaskId(safeTask.task_id)}. Note: a real submission consumes MiniMax quota.`
+          : `Task submitted. Task ID: ${shortTaskId(safeTask.task_id)}. Note: a real submission consumes MiniMax quota.`,
+      );
       setCurrentTask(safeTask);
       setSelectedTask(safeTask);
       startPolling(safeTask.task_id);
@@ -677,6 +988,8 @@ export default function App() {
 
   function copyParamsToForm(task) {
     if (!task) return;
+    const taskMode = task.generation_mode === 'image_to_video' ? 'image_to_video' : 'text_to_video';
+    setGenerationMode(taskMode);
     setModel(task.model || FALLBACK_MODEL_CONFIG.defaults.model);
     setDuration(Number(task.duration) || FALLBACK_MODEL_CONFIG.defaults.duration);
     setResolution(task.resolution || FALLBACK_MODEL_CONFIG.defaults.resolution);
@@ -684,10 +997,23 @@ export default function App() {
     if (typeof task.prompt === 'string') {
       setPrompt(task.prompt);
     }
-    setInfo(
-      'Parameters copied to the create form. Review and submit manually. ' +
-        'A new submission will consume MiniMax quota.',
-    );
+    // I2V task: explicitly clear any prior image state and prompt the user
+    // to pick a new first frame. We never restore image bytes from history.
+    if (taskMode === 'image_to_video') {
+      setUploadPreview(null);
+      setUploadError('');
+      setUrlCheckError('');
+      setImageUrlInput('');
+      setInfo(
+        '已把任务参数填回表单（文生视频/图生视频、prompt、模型、时长、分辨率）。' +
+          '图生视频任务不恢复首帧图片，请重新选择或粘贴图片 URL。',
+      );
+    } else {
+      setInfo(
+        'Parameters copied to the create form. Review and submit manually. ' +
+          'A new submission will consume MiniMax quota.',
+      );
+    }
     setError('');
   }
 
@@ -733,36 +1059,115 @@ export default function App() {
       <form className="card" onSubmit={onSubmit}>
         <h2>Create task</h2>
 
+        <div className="mode-toggle" role="tablist" aria-label="Generation mode">
+          {GENERATION_MODE_OPTIONS.map((opt) => (
+            <button
+              type="button"
+              key={opt.value}
+              className={`chip ${generationMode === opt.value ? 'active' : ''}`}
+              aria-pressed={generationMode === opt.value}
+              onClick={() => handleModeChange(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+
         <label htmlFor="prompt">Prompt</label>
         <textarea
           id="prompt"
-          placeholder="A calm cinematic close-up of windmills at sunset."
+          placeholder={isI2V ? 'Describe the motion you want from the first frame…' : 'A calm cinematic close-up of windmills at sunset.'}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
         />
         <p className="count">{promptLength}/{maxPromptLength} characters</p>
         {isPromptTooLong && <p className="error">Prompt exceeds max length.</p>}
 
-        <div className="camera-tools">
-          <p className="camera-label">Camera move</p>
-          <div className="camera-buttons">
-            {(modelConfig.camera_moves || []).map((move) => {
-              const used = countOccurrences(prompt, move);
-              const disabled = used >= 3;
-              return (
+        {!isI2V && (
+          <div className="camera-tools">
+            <p className="camera-label">Camera move</p>
+            <div className="camera-buttons">
+              {(modelConfig.camera_moves || []).map((move) => {
+                const used = countOccurrences(prompt, move);
+                const disabled = used >= 3;
+                return (
+                  <button
+                    type="button"
+                    className="chip"
+                    key={move}
+                    disabled={disabled}
+                    onClick={() => appendCameraMove(move)}
+                  >
+                    [{move}] {disabled ? `(max ${used})` : ''}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {isI2V && (
+          <div className="i2v-section">
+            <p className="section-label">首帧图片（first_frame_image）</p>
+
+            <label htmlFor="image-url">公网 HTTPS 图片 URL</label>
+            <input
+              id="image-url"
+              className="input"
+              placeholder="https://cdn.example.com/first-frame.jpg"
+              value={imageUrlInput}
+              onChange={(e) => handleImageUrlChange(e.target.value)}
+              disabled={Boolean(uploadPreview)}
+            />
+            {urlCheckError && <p className="error">{urlCheckError}</p>}
+
+            <label htmlFor="image-upload">或上传本地图片（FileReader → Data URL，不写入 localStorage）</label>
+            <input
+              id="image-upload"
+              ref={fileInputRef}
+              className="input"
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={(e) => handleImageFile(e.target.files?.[0])}
+            />
+            {imageBusy && <p className="hint">正在校验图片…</p>}
+            {uploadError && <p className="error">{uploadError}</p>}
+
+            {uploadPreview && (
+              <div className="image-preview">
+                <p className="preview-label">图片预览（不会上传到服务器）</p>
+                <img
+                  src={uploadPreview.dataUrl}
+                  alt="first frame preview"
+                  className="preview-img"
+                />
+                <ul className="preview-meta">
+                  <li>类型: {I2V_FORMAT_LABELS[uploadPreview.mime] || uploadPreview.mime}</li>
+                  <li>尺寸: {uploadPreview.width} × {uploadPreview.height}</li>
+                  <li>大小: {formatBytes(uploadPreview.sizeBytes)}</li>
+                  <li>短边: {Math.min(uploadPreview.width, uploadPreview.height)}px（要求 ≥ 300px）</li>
+                  <li>长宽比: {uploadPreview.ratio.toFixed(2)}（要求 0.40–2.50）</li>
+                </ul>
                 <button
                   type="button"
-                  className="chip"
-                  key={move}
-                  disabled={disabled}
-                  onClick={() => appendCameraMove(move)}
+                  className="button ghost"
+                  onClick={clearUploadedImage}
                 >
-                  [{move}] {disabled ? `(max ${used})` : ''}
+                  移除已上传图片
                 </button>
-              );
-            })}
+              </div>
+            )}
+
+            <div className="i2v-rules">
+              <p className="hint">
+                图片要求: JPG / JPEG / PNG / WebP，≤ 20 MB，短边 ≥ 300px，长宽比 2:5 到 5:2（0.40–2.50）。
+              </p>
+              <p className="hint">
+                上传图片会在浏览器内转成 Data URL 发给 MiniMax。本项目不会保存完整图片内容到数据库、localStorage 或任何公开文件。
+              </p>
+            </div>
           </div>
-        </div>
+        )}
 
         <div className="grid">
           <div>
@@ -813,7 +1218,7 @@ export default function App() {
           </p>
         )}
 
-        <p className="hint">{comboSupported ? supportHint(modelConfig, model, duration) : ''}</p>
+        <p className="hint">{comboSupported ? supportHint(activeConfig, model, duration) : ''}</p>
 
         <label className="checkbox">
           <input
@@ -825,10 +1230,16 @@ export default function App() {
         </label>
 
         <p className="warning">
-          Submitting a new task will create a real MiniMax text-to-video job and consume quota.
+          {isI2V
+            ? '提交后会创建一个真实的 MiniMax 图生视频任务并消耗额度。图生视频任务不保存首帧图片，仅保存摘要（类型 / host / sha256_short）。'
+            : 'Submitting a new task will create a real MiniMax text-to-video job and consume quota.'}
         </p>
 
-        <button className="button" type="submit" disabled={loading || !comboSupported || isPromptTooLong}>
+        <button
+          className="button"
+          type="submit"
+          disabled={loading || !comboSupported || isPromptTooLong || !imageReady}
+        >
           {showLoadingMessage}
         </button>
       </form>
@@ -843,6 +1254,12 @@ export default function App() {
         {selectedTask && (
           <div className="task-block">
             <p><strong>Task ID:</strong> {shortTaskId(selectedTask.task_id)}</p>
+            <p>
+              <strong>Mode:</strong>{' '}
+              <span className={`mode-pill mode-${selectedTask.generation_mode || 'text_to_video'}`}>
+                {GENERATION_MODE_LABEL[selectedTask.generation_mode] || GENERATION_MODE_LABEL.text_to_video}
+              </span>
+            </p>
             <p><strong>Model:</strong> {selectedTask.model}</p>
             <p><strong>Duration:</strong> {selectedTask.duration}s</p>
             <p><strong>Resolution:</strong> {selectedTask.resolution}</p>
@@ -851,6 +1268,20 @@ export default function App() {
             <p><strong>download_url:</strong> {hasDownloadUrl ? 'present' : 'absent'}</p>
             <p><strong>Created:</strong> {formatReadableTime(selectedTask.created_at)}</p>
             <p><strong>Updated:</strong> {formatReadableTime(selectedTask.updated_at)}</p>
+            {selectedTask.generation_mode === 'image_to_video' && (
+              <div className="image-summary-block">
+                <p><strong>input_image_present:</strong> {selectedTask.input_image_present ? 'true' : 'false'}</p>
+                <p><strong>input_image_type:</strong> {selectedTask.input_image_type || 'absent'}</p>
+                <p><strong>input_image_host:</strong> {selectedTask.input_image_host || 'absent'}</p>
+                <p><strong>input_image_sha256_short:</strong> {selectedTask.input_image_sha256_short || 'absent'}</p>
+                {selectedTask.input_image_summary && (
+                  <p className="hint">{selectedTask.input_image_summary}</p>
+                )}
+                <p className="hint">
+                  本系统不会保存或展示完整首帧图片 URL 或图片内容。
+                </p>
+              </div>
+            )}
             {pollingState.active && (
               <p className="hint">
                 Polling in progress (attempt {pollingState.attempt}/{pollingConfig.maxAttempts},
@@ -1129,6 +1560,8 @@ export default function App() {
                     const freshnessKey = task.download_url_status || 'unknown';
                     const freshnessLabel = DOWNLOAD_URL_STATUS_PILL_TEXT[freshnessKey] || freshnessKey;
                     const isSelected = selectedTask?.task_id === task.task_id;
+                    const modeKey = task.generation_mode === 'image_to_video' ? 'image_to_video' : 'text_to_video';
+                    const modeLabel = GENERATION_MODE_LABEL[modeKey];
                     return (
                       <li
                         key={task.task_id}
@@ -1141,6 +1574,7 @@ export default function App() {
                           </p>
                           <p className="history-item-meta">
                             <span className={`status-pill status-${statusClass}`}>{statusLabel}</span>
+                            <span className={`mode-pill mode-${modeKey}`}>{modeLabel}</span>
                             <span>model: {task.model || '-'}</span>
                             <span>{task.duration || '-'}s · {task.resolution || '-'}</span>
                             <span>file_id: {fileIdLabel}</span>
