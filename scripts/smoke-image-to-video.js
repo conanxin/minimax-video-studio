@@ -25,6 +25,12 @@ const I2V_DRY_RUN_LOCAL_JSON = path.resolve(I2V_DRY_RUN_LOCAL_DIR, 'i2v-smoke-dr
 const I2V_REAL_LOCAL_DIR = path.resolve(process.cwd(), 'reports', 'local');
 const I2V_REAL_LOCAL_MD = path.resolve(I2V_REAL_LOCAL_DIR, 'phase-j-i2v-smoke.local.md');
 const I2V_REAL_LOCAL_JSON = path.resolve(I2V_REAL_LOCAL_DIR, 'phase-j-i2v-smoke.local.json');
+// Phase J.2 incident containment: once-only local lock for the real
+// I2V branch. The lock lives under reports/local/ (gitignored) and is
+// only created when both CONFIRM_REAL_VIDEO=1 and CONFIRM_REAL_I2V=1
+// are set AND the script proceeds to submit. The dry-run branch never
+// touches this lock.
+const I2V_REAL_LOCK_PATH = path.resolve(I2V_REAL_LOCAL_DIR, 'i2v-real-smoke.lock');
 const CHECK_INTERVAL_MS = 10_000;
 const MAX_ATTEMPTS = 60;
 const I2V_TEST_IMAGE_WIDTH = 1024;
@@ -339,6 +345,79 @@ async function writeRealLocalReports(context) {
   console.log(`Local I2V JSON saved: ${I2V_REAL_LOCAL_JSON}`);
 }
 
+// Phase J.2 incident containment: once-only local lock for the real
+// I2V branch. The lock is a JSON file under reports/local/ (gitignored)
+// so it is never committed. It carries the masked task_id and the
+// timestamp of the submit attempt. To re-authorize a real submit, the
+// operator must explicitly delete the lock file.
+async function readI2VRealLock() {
+  try {
+    const raw = await fs.promises.readFile(I2V_REAL_LOCK_PATH, 'utf8');
+    try {
+      return JSON.parse(raw);
+    } catch (_err) {
+      return { raw_present: true, unparseable: true };
+    }
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+async function writeI2VRealLock(payload) {
+  await fs.promises.mkdir(path.dirname(I2V_REAL_LOCK_PATH), { recursive: true });
+  await fs.promises.writeFile(
+    I2V_REAL_LOCK_PATH,
+    JSON.stringify(payload, null, 2),
+    'utf8',
+  );
+}
+
+function maskTaskIdForLock(taskId) {
+  if (!taskId) return 'N/A';
+  const s = String(taskId);
+  if (s.length <= 8) return 'redacted';
+  return `${s.slice(0, 4)}...${s.slice(-4)}`;
+}
+
+function renderLockBlockedReport(existingLock) {
+  return `# I2V Smoke - Refused by Once-Only Lock
+
+This run refused to submit because a real-I2V submit has already
+been recorded in this checkout. Real I2V smoke is a one-shot per
+checkout operation; re-running it consumes MiniMax video quota
+without operator oversight.
+
+## Existing lock
+
+- lock_path: ${I2V_REAL_LOCK_PATH}
+- created_at: ${existingLock && existingLock.created_at ? existingLock.created_at : 'unknown'}
+- previous_task_id_masked: ${existingLock && existingLock.task_id_masked ? existingLock.task_id_masked : 'unknown'}
+- previous_real_run_finished_at: ${existingLock && existingLock.finished_at ? existingLock.finished_at : 'unknown'}
+
+## How to re-authorize
+
+If you have a fresh operator authorization and explicitly want to
+allow another real submit:
+
+1. Delete the lock file at \`${I2V_REAL_LOCK_PATH}\`.
+2. Re-run with \`CONFIRM_REAL_VIDEO=1 CONFIRM_REAL_I2V=1 npm run
+   smoke:i2v\`.
+
+The lock file lives under \`reports/local/\`, which is gitignored,
+so deleting it does not affect the public repository.
+
+## Why this exists
+
+The Phase J.2 incident on 2026-06-16 created two real I2V submits
+instead of the one authorized. The root cause was an
+execution-discipline violation: a \`node -e\` debugging replay of
+the smoke script ran with the \`CONFIRM_REAL_*\` env vars in scope
+and submitted a second task. This lock makes a second real submit
+mechanically impossible unless the operator explicitly deletes it.
+`;
+}
+
 async function main() {
   const start = new Date().toISOString();
   const report = {
@@ -385,15 +464,74 @@ async function main() {
     return;
   }
 
+  // Phase J.2 incident containment: once-only local lock. If a real
+  // submit has already happened in this checkout, refuse to submit
+  // again. The operator can delete the lock file to re-authorize.
+  const existingLock = await readI2VRealLock();
+  if (existingLock) {
+    report.failReason =
+      'Refused: real I2V smoke has already been run in this checkout. ' +
+      'Delete reports/local/i2v-real-smoke.lock to re-authorize.';
+    report.createdStatus = 'not_created';
+    report.finalStatus = 'refused_by_lock';
+    report.chargeUsed = 'No';
+    report.finishedAt = new Date().toISOString();
+    await fs.promises.mkdir(I2V_REAL_LOCAL_DIR, { recursive: true });
+    const blockedPath = path.resolve(
+      I2V_REAL_LOCAL_DIR,
+      'i2v-smoke-blocked-by-lock.local.md',
+    );
+    await fs.promises.writeFile(blockedPath, renderLockBlockedReport(existingLock), 'utf8');
+    console.error(report.failReason);
+    console.error(`Existing lock: ${I2V_REAL_LOCK_PATH}`);
+    console.error(`Block report: ${blockedPath}`);
+    await writeRealLocalReports(report);
+    await writeDryRunReports(report);
+    return;
+  }
+
   report.chargeUsed = 'Yes';
   report.requestTaskStarted = 'Yes';
 
   try {
     await runRealI2VSmoke(report);
+    // Create the once-only lock after a successful submit so that
+    // any subsequent attempt (including a debugging replay) cannot
+    // submit a second time without the operator deleting the lock.
+    // We write the lock with the masked task_id and the run start
+    // timestamp; we also record the finished_at so the next attempt
+    // can show when the previous one ended.
+    await writeI2VRealLock({
+      created_at: start,
+      finished_at: report.finishedAt,
+      task_id_masked: maskTaskIdForLock(report.taskId),
+      final_status: report.finalStatus,
+      fail_reason_kind:
+        report.finalStatus === 'Success'
+          ? 'success'
+          : report.failReason
+          ? 'failed'
+          : 'unknown',
+    });
   } catch (error) {
     report.finalStatus = 'failed';
     report.failReason = error.message || 'unknown error';
     console.error(error.message || error);
+    // Even on failure, write the lock: the operator must explicitly
+    // delete it before any second attempt. This is the whole point
+    // of the once-only guard.
+    try {
+      await writeI2VRealLock({
+        created_at: start,
+        finished_at: new Date().toISOString(),
+        task_id_masked: maskTaskIdForLock(report.taskId),
+        final_status: report.finalStatus,
+        fail_reason_kind: 'failed',
+        error_message_kind: (error && error.message) ? error.message.split('\n')[0].slice(0, 200) : 'unknown',
+      });
+    } catch (_lockErr) {
+      // best-effort lock write; never throw from the finally.
+    }
   } finally {
     report.finishedAt = new Date().toISOString();
     report.downloadUrl = safeText(report.downloadUrl);
