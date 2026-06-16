@@ -21,18 +21,64 @@ function maskUrl(value) {
   return 'present';
 }
 
-function assertApiKey() {
-  if (!process.env.MINIMAX_API_KEY) {
+// Phase J.1: normalize the env value so the client never sends
+// "Bearer Bearer <key>" or "Bearer <key> <key>" and so accidental
+// surrounding quotes / whitespace are stripped before the header is
+// assembled. This helper is the ONLY place that touches the raw env
+// value for auth purposes.
+function normalizeMiniMaxApiKey(raw) {
+  if (raw === undefined || raw === null) return '';
+  let value = String(raw);
+  // Strip surrounding double or single quotes if present.
+  value = value.trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1).trim();
+  }
+  // Strip internal whitespace, including newlines, that dotenv might
+  // have preserved from a multi-line paste.
+  value = value.replace(/\s+/g, '');
+  return value;
+}
+
+// Phase J.1: explicit construction of the Authorization header.
+// Throws a configuration error (NOT an HTTP error) if the env value
+// already starts with "Bearer " so that operators see a clear message
+// instead of getting a confusing upstream "login fail" 1004.
+function buildAuthorizationHeader(raw) {
+  const key = normalizeMiniMaxApiKey(raw);
+  if (!key) {
     const err = new Error('MINIMAX_API_KEY is required.');
     err.status = 401;
+    err.code = 'minimax_api_key_missing';
+    throw err;
+  }
+  if (/^bearer\s+/i.test(key)) {
+    const err = new Error(
+      'MINIMAX_API_KEY in .env already starts with "Bearer ". ' +
+        'Please store the bare API key in .env (no Bearer prefix).',
+    );
+    err.status = 500;
+    err.code = 'minimax_api_key_bearer_prefix';
+    throw err;
+  }
+  return `Bearer ${key}`;
+}
+
+function assertApiKey() {
+  if (!normalizeMiniMaxApiKey(process.env.MINIMAX_API_KEY)) {
+    const err = new Error('MINIMAX_API_KEY is required.');
+    err.status = 401;
+    err.code = 'minimax_api_key_missing';
     throw err;
   }
 }
 
 function requestHeaders() {
-  assertApiKey();
   return {
-    Authorization: `Bearer ${process.env.MINIMAX_API_KEY}`,
+    Authorization: buildAuthorizationHeader(process.env.MINIMAX_API_KEY),
     'Content-Type': 'application/json',
   };
 }
@@ -275,4 +321,6 @@ module.exports = {
   retrieveVideoFile,
   maskId,
   maskUrl,
+  normalizeMiniMaxApiKey,
+  buildAuthorizationHeader,
 };

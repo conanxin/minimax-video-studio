@@ -16,7 +16,8 @@
     "smoke:i2v": "node scripts/smoke-image-to-video.js",
     "import:local-smoke": "node scripts/import-local-smoke-to-db.js",
     "check:api": "node scripts/check-api-regression.js",
-    "check:open-source": "node scripts/check-open-source.js"
+    "check:open-source": "node scripts/check-open-source.js",
+    "check:minimax-auth": "node scripts/check-minimax-auth.js"
   },
   "dependencies": {
     "axios": "^1.8.4",
