@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * Phase E + Phase F - API regression check script.
+ * Phase E + Phase F + Phase G - API regression check script.
  *
  * Goals:
  *  1. Boot the backend, run a small regression suite, then shut it down.
  *  2. Cover auth, validation, polling-config endpoint, the file-refresh
- *     endpoint (only if a local Success + file_id task exists), and the
- *     Phase F task-list filtering, pagination, and search behaviour.
+ *     endpoint (only if a local Success + file_id task exists), the
+ *     Phase F task-list filtering, pagination, and search behaviour,
+ *     and the Phase G download-link freshness contract.
  *  3. NEVER call /api/video/create with a valid payload (that would consume
  *     MiniMax quota). Only the rejection paths are exercised.
  *  4. NEVER read, log, or print MINIMAX_API_KEY.
@@ -28,7 +29,7 @@ const { config } = require('dotenv');
 config();
 
 const ROOT = path.resolve(__dirname, '..');
-const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-f-api-regression.report.txt');
+const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-g-api-regression.report.txt');
 
 const PORT = Number(process.env.PORT) || 8789;
 const SITE_PASSCODE = String(process.env.SITE_PASSCODE || 'change_me').trim();
@@ -72,6 +73,124 @@ function assertNoDownloadUrlLeak(payload, label) {
   }
   recordResult(`${label}: no download_url leak`, true, 'no URL fragment detected');
   return true;
+}
+
+// Phase G: write deterministic local SQLite seed rows that exercise
+// the freshness state machine. All values are obviously fake: ids use
+// the `local-seed-g-` prefix, file_ids use `file-seed-g-`, and
+// download_url values are short local placeholders that the script
+// never logs verbatim. The DB file is gitignored; nothing here is
+// written to a public report.
+function seedFreshnessFixtures() {
+  return new Promise((resolve, reject) => {
+    const sqlite3 = require('sqlite3');
+    const { open } = require('sqlite');
+    const dbPath = path.resolve(ROOT, 'data', 'minimax-video-studio.sqlite');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    (async () => {
+      try {
+        const db = await open({ filename: dbPath, driver: sqlite3.Database });
+        // The same DB the server uses; create the table if missing so
+        // check:api can run on a clean machine.
+        await db.exec(`
+          CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT UNIQUE NOT NULL,
+            prompt TEXT NOT NULL,
+            model TEXT NOT NULL,
+            duration INTEGER NOT NULL,
+            resolution TEXT NOT NULL,
+            prompt_optimizer INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            file_id TEXT,
+            download_url TEXT,
+            fail_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `);
+        const cols = await db.all('PRAGMA table_info(tasks)');
+        const have = (n) => cols.some((c) => c.name === n);
+        if (!have('download_url_refreshed_at')) {
+          await db.exec('ALTER TABLE tasks ADD COLUMN download_url_refreshed_at TEXT');
+        }
+        if (!have('download_url_status')) {
+          await db.exec("ALTER TABLE tasks ADD COLUMN download_url_status TEXT DEFAULT 'unknown'");
+        }
+
+        const now = Date.now();
+        const isoOffset = (hours) => new Date(now - hours * 60 * 60 * 1000).toISOString();
+        const rows = [
+          {
+            task_id: 'local-seed-g-success-fresh',
+            file_id: 'file-seed-g-fresh',
+            download_url: 'local-placeholder://fresh',
+            refreshed_at: isoOffset(2), // 2h ago => fresh
+            updated_at: isoOffset(2),
+          },
+          {
+            task_id: 'local-seed-g-success-aging',
+            file_id: 'file-seed-g-aging',
+            download_url: 'local-placeholder://aging',
+            refreshed_at: isoOffset(15), // 15h ago => aging
+            updated_at: isoOffset(15),
+          },
+          {
+            task_id: 'local-seed-g-success-stale',
+            file_id: 'file-seed-g-stale',
+            download_url: 'local-placeholder://stale',
+            refreshed_at: isoOffset(30), // 30h ago => stale
+            updated_at: isoOffset(30),
+          },
+          {
+            task_id: 'local-seed-g-success-no-url',
+            file_id: 'file-seed-g-nourl',
+            download_url: null,
+            refreshed_at: null,
+            updated_at: isoOffset(1),
+          },
+          {
+            task_id: 'local-seed-g-fail',
+            file_id: null,
+            download_url: null,
+            refreshed_at: null,
+            updated_at: isoOffset(40),
+          },
+        ];
+
+        for (const r of rows) {
+          await db.run(
+            `INSERT OR REPLACE INTO tasks (
+              task_id, prompt, model, duration, resolution, prompt_optimizer,
+              status, file_id, download_url, fail_reason,
+              created_at, updated_at,
+              download_url_refreshed_at, download_url_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              r.task_id,
+              'Phase G seed prompt for freshness check',
+              'MiniMax-Hailuo-2.3',
+              6,
+              '768P',
+              1,
+              r.task_id === 'local-seed-g-fail' ? 'Fail' : 'Success',
+              r.file_id,
+              r.download_url,
+              r.task_id === 'local-seed-g-fail' ? 'simulated failure' : null,
+              isoOffset(50),
+              r.updated_at,
+              r.refreshed_at,
+              null,
+            ],
+          );
+        }
+        await db.close();
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    })();
+  });
 }
 
 async function waitForHealth(url, timeoutMs = 15000) {
@@ -347,6 +466,139 @@ async function runChecks() {
   } catch (err) {
     recordResult('GET /api/tasks?limit=999 -> 200, limit clamped', false, err.message);
   }
+
+  // 14. Phase G: download-link config endpoint exposes TTLs
+  try {
+    const r = await fetch(`${base}/api/download-link/config`);
+    const body = await r.json().catch(() => ({}));
+    const ok = r.status === 200
+      && Number.isFinite(body.warningTtlHours)
+      && Number.isFinite(body.softTtlHours)
+      && body.warningTtlHours < body.softTtlHours
+      && body.statuses
+      && body.statuses.fresh
+      && body.statuses.aging
+      && body.statuses.stale
+      && body.statuses.absent
+      && body.statuses.unknown;
+    recordResult(
+      'GET /api/download-link/config -> 200 with TTLs and statuses',
+      ok,
+      `status=${r.status} warningTtl=${body?.warningTtlHours} softTtl=${body?.softTtlHours}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/download-link/config -> 200', false, err.message);
+  }
+
+  // 15. Phase G: GET /api/tasks returns freshness block per task
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-g-&limit=50&offset=0`);
+    const body = await r.json().catch(() => ({}));
+    const rows = Array.isArray(body.tasks) ? body.tasks : [];
+    const ok = r.status === 200
+      && rows.length > 0
+      && rows.every((t) => (
+        'download_url_status' in t
+        && 'download_url_age_hours' in t
+        && 'should_refresh_download_url' in t
+        && 'download_url_present' in t
+        && ['fresh', 'aging', 'stale', 'absent', 'unknown'].includes(t.download_url_status)
+      ));
+    recordResult(
+      'GET /api/tasks -> 200, every row carries freshness fields',
+      ok,
+      `status=${r.status} rows=${rows.length}`,
+    );
+    assertNoDownloadUrlLeak(body, 'GET /api/tasks freshness fields');
+  } catch (err) {
+    recordResult('GET /api/tasks freshness fields', false, err.message);
+  }
+
+  // 16. Phase G: Success+file_id+no-url task -> absent / should_refresh=true
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-g-success-no-url`);
+    const body = await r.json().catch(() => ({}));
+    const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === 'local-seed-g-success-no-url') : null;
+    const ok = r.status === 200
+      && t
+      && t.download_url_present === false
+      && t.download_url_status === 'absent'
+      && t.should_refresh_download_url === true;
+    recordResult(
+      'GET /api/tasks?status=Success no-url -> absent + should_refresh=true',
+      ok,
+      `status=${r.status} status=${t?.download_url_status} should_refresh=${t?.should_refresh_download_url}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/tasks?status=Success no-url -> absent', false, err.message);
+  }
+
+  // 17. Phase G: Success+file_id+2h-old url -> fresh / should_refresh=false
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-g-success-fresh`);
+    const body = await r.json().catch(() => ({}));
+    const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === 'local-seed-g-success-fresh') : null;
+    const ok = r.status === 200
+      && t
+      && t.download_url_present === true
+      && t.download_url_status === 'fresh'
+      && t.should_refresh_download_url === false
+      && Number.isFinite(t.download_url_age_hours)
+      && t.download_url_age_hours < 24;
+    recordResult(
+      'GET /api/tasks?status=Success fresh-url -> fresh + should_refresh=false',
+      ok,
+      `status=${r.status} status=${t?.download_url_status} age=${t?.download_url_age_hours}h`,
+    );
+    assertNoDownloadUrlLeak(t, 'freshness row fresh');
+  } catch (err) {
+    recordResult('GET /api/tasks fresh-url -> fresh', false, err.message);
+  }
+
+  // 18. Phase G: Success+file_id+15h-old url -> aging / should_refresh=true
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-g-success-aging`);
+    const body = await r.json().catch(() => ({}));
+    const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === 'local-seed-g-success-aging') : null;
+    const ok = r.status === 200
+      && t
+      && t.download_url_present === true
+      && t.download_url_status === 'aging'
+      && t.should_refresh_download_url === true
+      && Number.isFinite(t.download_url_age_hours)
+      && t.download_url_age_hours >= 12
+      && t.download_url_age_hours < 24;
+    recordResult(
+      'GET /api/tasks?status=Success aging-url -> aging + should_refresh=true',
+      ok,
+      `status=${r.status} status=${t?.download_url_status} age=${t?.download_url_age_hours}h`,
+    );
+    assertNoDownloadUrlLeak(t, 'freshness row aging');
+  } catch (err) {
+    recordResult('GET /api/tasks aging-url -> aging', false, err.message);
+  }
+
+  // 19. Phase G: Success+file_id+30h-old url -> stale / should_refresh=true
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-g-success-stale`);
+    const body = await r.json().catch(() => ({}));
+    const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === 'local-seed-g-success-stale') : null;
+    const ok = r.status === 200
+      && t
+      && t.download_url_present === true
+      && t.download_url_status === 'stale'
+      && t.should_refresh_download_url === true
+      && Number.isFinite(t.download_url_age_hours)
+      && t.download_url_age_hours >= 24;
+    recordResult(
+      'GET /api/tasks?status=Success stale-url -> stale + should_refresh=true',
+      ok,
+      `status=${r.status} status=${t?.download_url_status} age=${t?.download_url_age_hours}h`,
+    );
+    assertNoDownloadUrlLeak(t, 'freshness row stale');
+  } catch (err) {
+    recordResult('GET /api/tasks stale-url -> stale', false, err.message);
+  }
 }
 
 async function main() {
@@ -358,19 +610,28 @@ async function main() {
     // ignore
   }
 
-  logLine(`[phase-f] check:api starting on port ${PORT}`);
+  logLine(`[phase-g] check:api starting on port ${PORT}`);
 
   if (process.env.CONFIRM_REAL_VIDEO === '1') {
-    logLine('[phase-f] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
+    logLine('[phase-g] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
     process.exitCode = 2;
     return;
   }
 
   try {
-    await startServer();
-    logLine(`[phase-f] server up on :${PORT}`);
+    await seedFreshnessFixtures();
+    logLine('[phase-g] local SQLite freshness fixtures seeded (offline, fake ids)');
   } catch (err) {
-    logLine(`[phase-f] failed to start server: ${err.message}`);
+    logLine(`[phase-g] failed to seed freshness fixtures: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    await startServer();
+    logLine(`[phase-g] server up on :${PORT}`);
+  } catch (err) {
+    logLine(`[phase-g] failed to start server: ${err.message}`);
     process.exitCode = 1;
     return;
   }
@@ -383,18 +644,18 @@ async function main() {
 
   const passed = checks.filter((c) => c.ok).length;
   const failed = checks.length - passed;
-  logLine(`[phase-f] summary: ${passed}/${checks.length} checks passed`);
+  logLine(`[phase-g] summary: ${passed}/${checks.length} checks passed`);
   if (failed > 0) {
-    logLine(`[phase-f] FAILED checks:`);
+    logLine(`[phase-g] FAILED checks:`);
     checks.filter((c) => !c.ok).forEach((c) => logLine(`  - ${c.name}: ${c.detail || ''}`));
     process.exitCode = 1;
   } else {
-    logLine(`[phase-f] all checks PASSED. No real MiniMax task was created.`);
+    logLine(`[phase-g] all checks PASSED. No real MiniMax task was created.`);
   }
 }
 
 main().catch((err) => {
-  logLine(`[phase-f] unexpected error: ${err && err.message ? err.message : err}`);
+  logLine(`[phase-g] unexpected error: ${err && err.message ? err.message : err}`);
   stopServer();
   process.exitCode = 1;
 });

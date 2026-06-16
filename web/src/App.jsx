@@ -54,6 +54,38 @@ const STATUS_FILTER_OPTIONS = [
 
 const HISTORY_PAGE_SIZE = 20;
 
+const DOWNLOAD_URL_STATUS_TEXT = {
+  fresh: '下载链接可用',
+  aging: '链接较久，建议刷新',
+  stale: '链接可能已过期',
+  absent: '未获取下载链接',
+  unknown: '暂无链接状态',
+};
+
+const DOWNLOAD_URL_STATUS_PILL_TEXT = {
+  fresh: 'fresh',
+  aging: 'aging',
+  stale: 'stale',
+  absent: 'absent',
+  unknown: 'unknown',
+};
+
+function formatAgeLabel(hours) {
+  if (hours === null || hours === undefined) return null;
+  const numeric = Number(hours);
+  if (!Number.isFinite(numeric)) return null;
+  if (numeric < 1) {
+    const minutes = Math.max(1, Math.round(numeric * 60));
+    return `${minutes} 分钟前刷新`;
+  }
+  if (numeric < 24) {
+    const rounded = Math.round(numeric);
+    return `${rounded} 小时前刷新`;
+  }
+  const days = Math.round(numeric / 24);
+  return `${days} 天前刷新`;
+}
+
 function normalizeStatus(status) {
   const value = String(status || '').toLowerCase();
   if (!value) return 'Unknown';
@@ -206,6 +238,7 @@ export default function App() {
   const [historySearchInput, setHistorySearchInput] = useState('');
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyNotice, setHistoryNotice] = useState('');
+  const [videoError, setVideoError] = useState(false);
   const [pollingState, setPollingState] = useState({ active: false, attempt: 0, exhausted: false });
   const pollingTimer = useRef(null);
   const pollingStartedAt = useRef(null);
@@ -573,11 +606,13 @@ export default function App() {
     setSelectedTask(task);
     setError('');
     setInfo('');
+    setVideoError(false);
 
     if (passcode.trim()) {
       try {
         const detail = await requestJson(`/api/video/task/${encodeURIComponent(task.task_id)}`);
         setSelectedTask({ ...detail, status: normalizeStatus(detail.status) });
+        setVideoError(false);
       } catch (err) {
         setError(err.message || 'Failed to load task detail.');
       }
@@ -612,6 +647,7 @@ export default function App() {
     setRefreshingId(task.file_id);
     setError('');
     setInfo('');
+    setVideoError(false);
     try {
       const response = await requestJson(
         `/api/video/file/${encodeURIComponent(task.file_id)}/refresh`,
@@ -622,6 +658,10 @@ export default function App() {
         status: normalizeStatus(response.status || task.status),
         file_id: response.file_id,
         download_url: response.download_url,
+        download_url_refreshed_at: response.download_url_refreshed_at || response.refreshed_at,
+        download_url_status: response.download_url_status,
+        download_url_age_hours: response.download_url_age_hours,
+        should_refresh_download_url: response.should_refresh_download_url,
         updated_at: response.refreshed_at || task.updated_at,
       };
       setCurrentTask(updated);
@@ -676,7 +716,7 @@ export default function App() {
     <main className="page">
       <header className="hero">
         <h1>MiniMax Text-to-Video MVP</h1>
-        <p>Phase F: task history UI, filtering, pagination, and local usability polish.</p>
+        <p>Phase G: download link freshness indicators and link-freshness UX.</p>
       </header>
 
       <section className="card">
@@ -824,6 +864,33 @@ export default function App() {
               <p className="error">Fail reason: {selectedTask.fail_reason}</p>
             )}
 
+            {terminalStatus === 'Success' && hasFileId && (
+              <div className="freshness-block">
+                <p>
+                  <strong>下载链接状态:</strong>{' '}
+                  <span className={`freshness-pill freshness-${(selectedTask.download_url_status || 'unknown')}`}>
+                    {DOWNLOAD_URL_STATUS_PILL_TEXT[selectedTask.download_url_status] || selectedTask.download_url_status || 'unknown'}
+                  </span>
+                  <span className="freshness-zh">
+                    {DOWNLOAD_URL_STATUS_TEXT[selectedTask.download_url_status] || ''}
+                  </span>
+                </p>
+                {selectedTask.download_url && (
+                  <p className="hint">
+                    {formatAgeLabel(selectedTask.download_url_age_hours)
+                      ? `${formatAgeLabel(selectedTask.download_url_age_hours)}。`
+                      : ''}
+                    {' '}这不是 MiniMax 强制过期时间，仅为软提示。
+                  </p>
+                )}
+                {selectedTask.should_refresh_download_url && (
+                  <p className="warning">
+                    建议点击下方“{hasDownloadUrl ? '重新获取下载链接' : '获取下载链接'}”以避免使用过期链接。
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="task-actions">
               <button
                 className="button ghost"
@@ -877,7 +944,17 @@ export default function App() {
         {selectedTask?.status === 'Success' && hasDownloadUrl && (
           <div className="video-area">
             <h3>Generated result</h3>
-            <video controls src={selectedTask.download_url} />
+            <video
+              controls
+              src={selectedTask.download_url}
+              onError={() => setVideoError(true)}
+              onLoadedData={() => setVideoError(false)}
+            />
+            {videoError && (
+              <p className="warning">
+                如果视频无法播放，请尝试“重新获取下载链接”——可能当前 download_url 已过期。
+              </p>
+            )}
             <a className="link" href={selectedTask.download_url} target="_blank" rel="noreferrer">
               Download video
             </a>
@@ -1003,6 +1080,8 @@ export default function App() {
                       ? `present (${shortId(task.file_id)})`
                       : 'absent';
                     const downloadLabel = task.download_url ? 'present' : 'absent';
+                    const freshnessKey = task.download_url_status || 'unknown';
+                    const freshnessLabel = DOWNLOAD_URL_STATUS_PILL_TEXT[freshnessKey] || freshnessKey;
                     const isSelected = selectedTask?.task_id === task.task_id;
                     return (
                       <li
@@ -1020,6 +1099,11 @@ export default function App() {
                             <span>{task.duration || '-'}s · {task.resolution || '-'}</span>
                             <span>file_id: {fileIdLabel}</span>
                             <span>download_url: {downloadLabel}</span>
+                            {normalizeStatus(task.status) === 'Success' && task.file_id && (
+                              <span className={`freshness-pill freshness-${freshnessKey}`}>
+                                link: {freshnessLabel}
+                              </span>
+                            )}
                           </p>
                           <p className="history-item-time">
                             更新 {formatReadableTime(task.updated_at)}

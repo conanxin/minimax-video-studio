@@ -22,6 +22,8 @@ const {
   retrieveVideoFile,
 } = require('./services/minimaxClient');
 const pollingConfig = require('../shared/pollingConfig.json');
+const freshness = require('./services/downloadLinkFreshness');
+const { toIsoNow } = require('./db');
 
 config();
 
@@ -60,6 +62,22 @@ app.get('/api/polling/config', (_req, res) => {
   });
 });
 
+app.get('/api/download-link/config', (_req, res) => {
+  res.json({
+    warningTtlHours: freshness.getWarningTtlHours(),
+    softTtlHours: freshness.getSoftTtlHours(),
+    statuses: {
+      fresh: freshness.STATUSES.FRESH,
+      aging: freshness.STATUSES.AGING,
+      stale: freshness.STATUSES.STALE,
+      absent: freshness.STATUSES.ABSENT,
+      unknown: freshness.STATUSES.UNKNOWN,
+    },
+    source: 'shared/downloadLinkConfig.json',
+    note: 'Soft advisory only. The URL is not guaranteed to expire at these boundaries. The user must always click Refresh download link to fetch a new URL from MiniMax.',
+  });
+});
+
 function getPasscode(req) {
   return req.body?.passcode || req.query?.passcode || req.headers['x-site-passcode'];
 }
@@ -84,6 +102,7 @@ function normalizeTaskPayload(req) {
 
 function toSafeTaskPayload(task) {
   if (!task) return null;
+  const summary = freshness.classify(task);
   return {
     id: task.id,
     task_id: task.task_id,
@@ -98,6 +117,11 @@ function toSafeTaskPayload(task) {
     fail_reason: task.fail_reason,
     created_at: task.created_at,
     updated_at: task.updated_at,
+    download_url_refreshed_at: task.download_url_refreshed_at || null,
+    download_url_present: summary.download_url_present,
+    download_url_status: summary.download_url_status,
+    download_url_age_hours: summary.download_url_age_hours,
+    should_refresh_download_url: summary.should_refresh_download_url,
   };
 }
 
@@ -118,8 +142,12 @@ async function syncTaskById(taskId) {
       const file = await retrieveVideoFile(remote.file_id).catch(() => null);
       if (file?.download_url) {
         patch.download_url = file.download_url;
+        patch.download_url_refreshed_at = toIsoNow();
+        patch.download_url_status = freshness.STATUSES.FRESH;
       } else if (remote.download_url) {
         patch.download_url = remote.download_url;
+        patch.download_url_refreshed_at = toIsoNow();
+        patch.download_url_status = freshness.STATUSES.FRESH;
       }
     }
 
@@ -203,7 +231,11 @@ app.get('/api/video/file/:fileId', requirePasscode, async (req, res) => {
   if (!task.download_url && task.file_id) {
     const response = await retrieveVideoFile(fileId).catch(() => null);
     if (response?.download_url) {
-      await updateTaskByTaskId(task.task_id, { download_url: response.download_url });
+      await updateTaskByTaskId(task.task_id, {
+        download_url: response.download_url,
+        download_url_refreshed_at: toIsoNow(),
+        download_url_status: freshness.STATUSES.FRESH,
+      });
       task.download_url = response.download_url;
     }
   }
@@ -239,6 +271,8 @@ app.post('/api/video/file/:fileId/refresh', requirePasscode, async (req, res) =>
     const patch = { file_id: remoteFileId };
     if (remoteDownloadUrl) {
       patch.download_url = remoteDownloadUrl;
+      patch.download_url_refreshed_at = toIsoNow();
+      patch.download_url_status = freshness.STATUSES.FRESH;
     }
 
     const updated = await updateTaskByTaskId(task.task_id, patch);
@@ -250,6 +284,10 @@ app.post('/api/video/file/:fileId/refresh', requirePasscode, async (req, res) =>
       status: safeUpdated.status,
       download_url: safeUpdated.download_url,
       download_url_present: Boolean(safeUpdated.download_url),
+      download_url_status: safeUpdated.download_url_status,
+      download_url_age_hours: safeUpdated.download_url_age_hours,
+      should_refresh_download_url: safeUpdated.should_refresh_download_url,
+      download_url_refreshed_at: safeUpdated.download_url_refreshed_at,
       refreshed_at: safeUpdated.updated_at,
       message: safeUpdated.download_url
         ? 'Download link refreshed.'

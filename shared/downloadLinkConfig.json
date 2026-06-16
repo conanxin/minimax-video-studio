@@ -1,0 +1,5 @@
+{
+  "warningTtlHours": 12,
+  "softTtlHours": 24,
+  "description": "Soft TTL hints for download_url freshness. These are advisory only; the URL is not guaranteed to expire exactly at these boundaries. The user must always click 'Refresh download link' to fetch a new URL from MiniMax. Backend code never auto-refreshes."
+}

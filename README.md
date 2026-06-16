@@ -14,6 +14,8 @@ Current status:
   checks are merged.
 - Phase F task history UI, filtering, pagination, search, time
   grouping, and copy-params affordances are merged.
+- Phase G download link freshness indicators and link-freshness UX
+  are merged.
 - Default smoke checks are non-consuming (dry run).
 
 ## Features
@@ -25,6 +27,13 @@ Current status:
 - Manual `Refresh download link` button for `Success + file_id` tasks
 - Re-fetch download link when the original `download_url` is missing
   or expired (`POST /api/video/file/:fileId/refresh`)
+- Soft download-link freshness hints: `fresh` / `aging` / `stale` /
+  `absent` / `unknown`, computed from
+  `shared/downloadLinkConfig.json` and exposed in every task
+  response
+- Per-task video error fallback: if the `<video>` element fails to
+  load, the detail panel surfaces a hint pointing to
+  `Re-fetch download link` instead of silently failing
 - Task history listing with status filter, keyword search, and
   paginated backend (`GET /api/tasks?limit=&offset=&status=&q=`)
 - Time-grouped task history (Today / Yesterday / Earlier)
@@ -55,6 +64,11 @@ Phase F keeps the same scope discipline. It only polishes the local
 task history UI (filtering, pagination, search, time grouping,
 copy-params affordances) and the matching backend
 `GET /api/tasks` endpoint. It does **not** introduce new
+generation modes, Docker, CI, or dependency changes.
+
+Phase G follows the same scope discipline. It only adds a soft
+download-link freshness hint layer on top of the existing refresh
+endpoint. It does **not** auto-refresh, does **not** introduce new
 generation modes, Docker, CI, or dependency changes.
 
 ## Project structure
@@ -165,12 +179,29 @@ npm run smoke:video
     empty / partial result set instead of leaking data
   - `GET /api/tasks?limit=999` returns 200 with `pagination.limit`
     clamped to `<= 100`
+  - `GET /api/download-link/config` returns the shared
+    `warningTtlHours` / `softTtlHours` and the five freshness
+    statuses
+  - `GET /api/tasks` returns `download_url_status` /
+    `download_url_age_hours` / `should_refresh_download_url` /
+    `download_url_present` on every row
+  - `Success + file_id + no download_url` is reported as
+    `absent` with `should_refresh_download_url: true`
+  - `Success + file_id + 2h-old download_url` is reported as
+    `fresh` with `should_refresh_download_url: false`
+  - `Success + file_id + 15h-old download_url` is reported as
+    `aging` with `should_refresh_download_url: true`
+  - `Success + file_id + 30h-old download_url` is reported as
+    `stale` with `should_refresh_download_url: true`
 - The script aborts immediately if `CONFIRM_REAL_VIDEO=1` is set.
 - The script never reads, logs, or prints `MINIMAX_API_KEY`.
 - The script never prints a real `download_url`; it only asserts
   presence/absence.
+- The Phase G run writes local SQLite seed rows (`local-seed-g-*`
+  prefix) before booting the server. These rows are obviously fake
+  and live in the same gitignored `data/*.sqlite` file.
 - The run output is appended to
-  `reports/phase-f-api-regression.report.txt` (gitignored).
+  `reports/phase-g-api-regression.report.txt` (gitignored).
 
 ```bash
 npm run check:api
@@ -228,6 +259,71 @@ existing refresh actions:
 For failed tasks the panel shows an additional red-bordered warning
 reminding the user that a fresh submission will consume MiniMax
 quota. The buttons never auto-submit.
+
+## Download link freshness
+
+Phase G adds a soft advisory TTL layer on top of the existing
+`POST /api/video/file/:fileId/refresh` endpoint. The TTL values
+are defined in `shared/downloadLinkConfig.json`:
+
+| Field             | Default | Meaning                                              |
+|-------------------|---------|------------------------------------------------------|
+| `warningTtlHours` | `12`    | URL younger than this is `fresh`                     |
+| `softTtlHours`    | `24`    | URL between `warningTtlHours` and `softTtlHours` is `aging`; older is `stale` |
+
+For every `Success` task that has a `file_id`, the backend returns:
+
+| Field                          | Type     | Notes |
+|--------------------------------|----------|-------|
+| `download_url_present`         | `bool`   | `true` iff a `download_url` is stored locally |
+| `download_url_status`          | `string` | `fresh` / `aging` / `stale` / `absent` / `unknown` |
+| `download_url_age_hours`       | `number` | hours since the last successful refresh, or `null` if unknown |
+| `should_refresh_download_url`  | `bool`   | `true` for `absent` / `aging` / `stale` / unknown-age rows |
+| `download_url_refreshed_at`    | `string` | ISO 8601 of the last successful refresh; `null` if never |
+
+State machine:
+
+| Task shape | `download_url_status` | `should_refresh_download_url` |
+|------------|----------------------|------------------------------|
+| `Success + file_id` and no stored URL | `absent` | `true` |
+| `Success + file_id`, URL age `< warningTtlHours` | `fresh` | `false` |
+| `Success + file_id`, URL age in `[warningTtlHours, softTtlHours)` | `aging` | `true` |
+| `Success + file_id`, URL age `>= softTtlHours` | `stale` | `true` |
+| `Success` without `file_id` | `unknown` | `false` |
+| any non-`Success` status | `unknown` | `false` |
+
+Hard rules:
+
+- The backend **never** auto-refreshes the `download_url`. Every
+  refresh happens only when the user clicks `Re-fetch download
+  link` (or `Refresh download link` for absent URLs).
+- The age is computed from `download_url_refreshed_at` when
+  present, falling back to `updated_at` for legacy rows that were
+  created before Phase G.
+- The TTL bounds are advisory. The actual MiniMax `download_url`
+  may or may not be expired at these boundaries — the user is
+  expected to click refresh if a video fails to play.
+- Re-fetching a download link does **not** create a new video
+  task. It only calls `POST /v1/files/retrieve`.
+- Re-submitting a task (filling the form with the task's
+  parameters and clicking Submit) **does** create a new video
+  task and consumes MiniMax quota.
+
+The frontend renders:
+
+- A status pill (`fresh` / `aging` / `stale` / `absent` / `unknown`)
+  on the task detail panel and on each history card.
+- An age label such as `2 小时前刷新` in the detail panel.
+- A red-bordered warning in the detail panel when
+  `should_refresh_download_url` is `true`, pointing the user at
+  the existing `Re-fetch download link` / `Refresh download link`
+  button.
+- A red-bordered `如果视频无法播放，请尝试"重新获取下载链接"`
+  hint whenever the `<video>` element fires an error event.
+
+The `q` value used by the new check:api freshness regression
+tests is bound through `?` parameters in `sqlite3`, so the same
+SQL-injection-safety guarantee from Phase F applies.
 
 ## Polling guardrails
 

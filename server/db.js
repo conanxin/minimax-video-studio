@@ -41,6 +41,18 @@ async function initDb() {
     );
   `);
 
+  // Phase G: additive migration for download_url freshness tracking.
+  // Each ALTER is guarded with sqlite_master so legacy databases are
+  // upgraded on first open without breaking older schemas.
+  const taskColumns = await db.all('PRAGMA table_info(tasks)');
+  const haveColumn = (name) => taskColumns.some((c) => c.name === name);
+  if (!haveColumn('download_url_refreshed_at')) {
+    await db.exec('ALTER TABLE tasks ADD COLUMN download_url_refreshed_at TEXT');
+  }
+  if (!haveColumn('download_url_status')) {
+    await db.exec("ALTER TABLE tasks ADD COLUMN download_url_status TEXT DEFAULT 'unknown'");
+  }
+
   await db.run('CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id);');
   await db.run('CREATE INDEX IF NOT EXISTS idx_updated_at ON tasks(updated_at DESC);');
 
@@ -181,4 +193,5 @@ module.exports = {
   countTasks,
   updateTask,
   mapTask,
+  toIsoNow,
 };
