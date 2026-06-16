@@ -146,6 +146,33 @@ practice, not just in design.
 
 ## 6. Tag and release
 
+### Tag pointer decision (honest record)
+
+The operator brief said *"confirm `main@beacc0d` is a clean,
+buildable, regression-passing deployment baseline"* and
+*"create the annotated `v0.2.1-alpha` tag"*. Taken literally,
+the tag could be pointed at either `beacc0d` (the
+"deployment baseline" commit) or at the Phase M commit that
+includes the release notes (`96e9691`). Phase M chose
+**`96e9691`** for one specific reason: the release notes
+file (`docs/RELEASE_NOTES_v0.2.1-alpha.md`) is a
+deliverable of the v0.2.1-alpha release, and an operator who
+checks out `v0.2.1-alpha` should see those notes in-tree
+without having to also pull the latest main. The code in
+`96e9691` is byte-for-byte identical to `beacc0d`; the diff
+is three documentation files only.
+
+If the operator would rather have the tag at `beacc0d`
+strictly, this can be moved in a future phase:
+
+```bash
+git tag -d v0.2.1-alpha
+git tag -a v0.2.1-alpha <beacc0d-sha> \
+  -m "v0.2.1-alpha: deployment baseline with sticky lock regression fix"
+git push origin :refs/tags/v0.2.1-alpha
+git push origin v0.2.1-alpha
+```
+
 ### Tag
 
 ```text
@@ -159,7 +186,7 @@ After this step:
   `v0.2.1-alpha`.
 - `git ls-remote --tags origin | grep v0.2.1` shows
   `refs/tags/v0.2.1-alpha` and
-  `refs/tags/v0.2.1-alpha^{}` pointing at `beacc0d`.
+  `refs/tags/v0.2.1-alpha^{}` pointing at `96e9691`.
 - `v0.2.0-alpha` is unchanged: still annotated, still
   pointing at `ada27c9`.
 
