@@ -7,7 +7,13 @@ This repository is an open-source starter for cloning and local development. It 
 > You need your own MiniMax Token Plan API Key to run real generation.
 
 Current status:
-- `v0.2.0-alpha` has been published (tag points to commit `ada27c9`).
+- `v0.2.1-alpha` is the **recommended deployment baseline**. Tag
+  points to commit `beacc0d`.
+- `v0.2.0-alpha` (tag points to commit `ada27c9`) is preserved
+  as the "first I2V verified" release. Upgraders are encouraged
+  to jump straight to `v0.2.1-alpha`; the v0.2.0 → v0.2.1 delta
+  is regression fixes only and does not change any user-facing
+  behaviour.
 - T2V real smoke has been verified once.
 - I2V real smoke has been verified once (Phase J.4, fixture-driven
   first frame, 10/10 offline fixture validation PASS).
@@ -854,3 +860,18 @@ The release notes for v0.2.0-alpha live at:
 The Phase K readiness report (offline, no real MiniMax submit) is at:
 
 - [`docs/PHASE_K_RELEASE_AND_DEPLOYMENT_READINESS_REPORT.md`](docs/PHASE_K_RELEASE_AND_DEPLOYMENT_READINESS_REPORT.md)
+
+## Releases
+
+This project keeps both `v0.2.0-alpha` and `v0.2.1-alpha` as
+publishable tags. Pick one explicitly:
+
+- `v0.2.1-alpha` — **recommended deployment baseline** (post-release
+  regression fix; `check:api` 72/72 PASS; sticky I2V lock contract
+  preserved across runs).
+  Release notes:
+  [`docs/RELEASE_NOTES_v0.2.1-alpha.md`](docs/RELEASE_NOTES_v0.2.1-alpha.md).
+- `v0.2.0-alpha` — first I2V-verified release. Preserved for
+  reproducibility of the Phase J.4 single-submit record.
+  Release notes:
+  [`docs/RELEASE_NOTES_v0.2.0-alpha.md`](docs/RELEASE_NOTES_v0.2.0-alpha.md).
