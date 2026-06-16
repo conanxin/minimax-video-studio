@@ -23,7 +23,7 @@
  *   2 - aborted before run (e.g. CONFIRM_REAL_VIDEO=1 detected)
  */
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { config } = require('dotenv');
@@ -1257,6 +1257,200 @@ async function runChecks() {
     }
   } catch (err) {
     recordResult('smoke:i2v dry-run hygiene', false, err.message);
+  }
+
+  // 44. Phase J.3: I2V fixture generator and validator scripts exist.
+  try {
+    const genPath = path.resolve(ROOT, 'scripts', 'generate-i2v-fixture.js');
+    const valPath = path.resolve(ROOT, 'scripts', 'validate-i2v-fixture.js');
+    const fixPath = path.resolve(ROOT, 'test', 'fixtures', 'i2v-smoke-first-frame.png');
+    const genExists = fs.existsSync(genPath);
+    const valExists = fs.existsSync(valPath);
+    const fixExists = fs.existsSync(fixPath);
+    recordResult(
+      'scripts/generate-i2v-fixture.js exists',
+      genExists,
+      genExists ? 'present' : 'missing',
+    );
+    recordResult(
+      'scripts/validate-i2v-fixture.js exists',
+      valExists,
+      valExists ? 'present' : 'missing',
+    );
+    recordResult(
+      'test/fixtures/i2v-smoke-first-frame.png exists',
+      fixExists,
+      fixExists ? `${fs.statSync(fixPath).size} bytes` : 'missing',
+    );
+  } catch (err) {
+    recordResult('Phase J.3 fixture script presence', false, err.message);
+  }
+
+  // 45. Phase J.3: scripts/smoke-image-to-video.js no longer contains
+  //     a hand-written PNG chunk encoder main path. The previous
+  //     encoder (buildMinimalPngDataUrl + private crc32 helper) was
+  //     the root cause of the Phase J.2 incident.
+  try {
+    const smokeSrc = fs.readFileSync(
+      path.resolve(ROOT, 'scripts', 'smoke-image-to-video.js'),
+      'utf8',
+    );
+    const hasLegacyEncoder = /function\s+buildMinimalPngDataUrl/.test(smokeSrc);
+    const hasLegacyCrc32 = /function\s+crc32\(/.test(smokeSrc);
+    const hasFixtureLoad = /function\s+loadI2VFixtureDataUrl|async\s+function\s+loadI2VFixtureDataUrl|require\(['"]pngjs['"]\)/.test(
+      smokeSrc,
+    );
+    recordResult(
+      'smoke-image-to-video.js does not include hand-written PNG encoder (buildMinimalPngDataUrl)',
+      !hasLegacyEncoder,
+      hasLegacyEncoder ? 'legacy function still present' : 'removed in Phase J.3',
+    );
+    recordResult(
+      'smoke-image-to-video.js does not include hand-written PNG crc32 helper',
+      !hasLegacyCrc32,
+      hasLegacyCrc32 ? 'legacy helper still present' : 'removed in Phase J.3',
+    );
+    recordResult(
+      'smoke-image-to-video.js sources first_frame_image from fixture (loadI2VFixtureDataUrl / pngjs)',
+      hasFixtureLoad,
+      hasFixtureLoad ? 'fixture path active' : 'fixture path not detected',
+    );
+  } catch (err) {
+    recordResult('smoke-image-to-video.js fixture wiring', false, err.message);
+  }
+
+  // 46. Phase J.3: npm run fixture:i2v:validate exits 0 with PASS
+  try {
+    const v = spawnSync(
+      process.execPath,
+      [path.resolve(ROOT, 'scripts', 'validate-i2v-fixture.js')],
+      { cwd: ROOT, encoding: 'utf8' },
+    );
+    const passed =
+      v.status === 0 && /10\/10 checks passed/.test((v.stdout || '') + (v.stderr || ''));
+    recordResult(
+      'npm run fixture:i2v:validate -> 0 + 10/10 PASS',
+      passed,
+      `exit=${v.status}`,
+    );
+  } catch (err) {
+    recordResult('fixture:i2v:validate', false, err.message);
+  }
+
+  // 47. Phase J.3: smoke:i2v dry-run leaves no lock behind, data_url
+  //     present but no full Data URL echoed in stdout.
+  try {
+    const lockPath = path.resolve(ROOT, 'reports', 'local', 'i2v-real-smoke.lock');
+    let lockBefore = false;
+    try { lockBefore = fs.existsSync(lockPath); } catch (_) { /* ignore */ }
+    const smoke = spawn(process.execPath, [path.resolve(ROOT, 'scripts', 'smoke-image-to-video.js')], {
+      cwd: ROOT,
+      env: { ...process.env, PORT: '0', NODE_ENV: 'test' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let smokeOut = '';
+    smoke.stdout.on('data', (c) => { smokeOut += c.toString(); });
+    smoke.stderr.on('data', (c) => { smokeOut += c.toString(); });
+    await new Promise((resolve) => smoke.on('exit', resolve));
+    let lockAfter = false;
+    try { lockAfter = fs.existsSync(lockPath); } catch (_) { /* ignore */ }
+    recordResult(
+      'smoke:i2v dry-run does not create the real-smoke lock',
+      !lockAfter && !lockBefore,
+      `before=${lockBefore} after=${lockAfter}`,
+    );
+    // Detect a stray "data:image/png;base64,<long-string>" pattern in
+    // the dry-run output. The smoke script intentionally logs only the
+    // kind/length/sha8, never the bytes.
+    const dataUrlPattern = /data:image\/png;base64,[A-Za-z0-9+/=]{200,}/;
+    const fullDataUrlLeaked = dataUrlPattern.test(smokeOut);
+    const dataUrlPresentFlag = /data_url_present:\s*yes/.test(smokeOut);
+    recordResult(
+      'smoke:i2v dry-run logs data_url_present=yes',
+      dataUrlPresentFlag,
+      dataUrlPresentFlag ? 'flag present' : 'flag missing',
+    );
+    recordResult(
+      'smoke:i2v dry-run does not echo full Data URL',
+      !fullDataUrlLeaked,
+      fullDataUrlLeaked ? 'full data URL found in output' : 'only length / sha8 / kind logged',
+    );
+  } catch (err) {
+    recordResult('smoke:i2v dry-run Phase J.3 hygiene', false, err.message);
+  }
+
+  // 48. Phase J.3: smoke:i2v real mode with I2V_SMOKE_TEST_LOCK_ONLY=1
+  //     and a synthetic lock present MUST refuse via the lock gate and
+  //     must NOT touch MiniMax. This exercises the Phase J.2 once-only
+  //     lock through the real-mode code path without making any remote
+  //     call.
+  try {
+    const lockPath = path.resolve(ROOT, 'reports', 'local', 'i2v-real-smoke.lock');
+    const mdPath = path.resolve(ROOT, 'reports', 'local', 'i2v-smoke-blocked-by-lock.local.md');
+    // Make sure there is no leftover lock from a previous run.
+    try { fs.unlinkSync(lockPath); } catch (_) { /* ignore */ }
+    // Plant a synthetic lock.
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        created_at: '2026-06-16T12:00:00.000Z',
+        finished_at: '2026-06-16T12:00:01.000Z',
+        task_id_masked: 'red...cted',
+        final_status: 'failed',
+        fail_reason_kind: 'failed',
+        synthetic_for_check_api: true,
+      }, null, 2),
+      'utf8',
+    );
+    let mdBefore = null;
+    try { mdBefore = fs.statSync(mdPath).mtimeMs; } catch (_) { mdBefore = null; }
+    const smoke = spawn(process.execPath, [path.resolve(ROOT, 'scripts', 'smoke-image-to-video.js')], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        CONFIRM_REAL_VIDEO: '1',
+        CONFIRM_REAL_I2V: '1',
+        I2V_SMOKE_TEST_LOCK_ONLY: '1',
+        PORT: '0',
+        NODE_ENV: 'test',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let smokeOut = '';
+    smoke.stdout.on('data', (c) => { smokeOut += c.toString(); });
+    smoke.stderr.on('data', (c) => { smokeOut += c.toString(); });
+    const smokeExit = await new Promise((resolve) => smoke.on('exit', resolve));
+    let mdAfter = null;
+    try { mdAfter = fs.statSync(mdPath).mtimeMs; } catch (_) { mdAfter = null; }
+    const refused = /refused_by_lock|refused_by_fixture/.test(smokeOut);
+    const noMiniMaxTrace = !/MiniMax I2V created|createImageToVideo|video_generation/.test(serverStderr);
+    recordResult(
+      'smoke:i2v real+lock+test-mode refuses via once-only lock',
+      refused && smokeExit === 0,
+      `exit=${smokeExit} refused=${refused}`,
+    );
+    recordResult(
+      'smoke:i2v real+lock+test-mode did not call MiniMax',
+      noMiniMaxTrace,
+      noMiniMaxTrace ? 'no remote trace in server stderr' : 'unexpected MiniMax trace',
+    );
+    recordResult(
+      'smoke:i2v real+lock+test-mode wrote a blocked-by-lock local report',
+      mdAfter !== null && mdAfter !== mdBefore,
+      mdAfter === null ? 'report missing' : 'report refreshed',
+    );
+    // Cleanup: leave the lock in place if it was already there
+    // before our test; otherwise remove it so subsequent runs are
+    // not blocked. (The lock is gitignored so this never reaches git.)
+    try {
+      const raw = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      if (raw && raw.synthetic_for_check_api) {
+        fs.unlinkSync(lockPath);
+      }
+    } catch (_) { /* ignore */ }
+  } catch (err) {
+    recordResult('smoke:i2v real+lock+test-mode', false, err.message);
   }
 }
 

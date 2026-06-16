@@ -18,6 +18,15 @@ Current status:
   are merged.
 - Phase H error categorization and smoke dry-run hygiene are
   merged.
+- Phase J controlled real I2V smoke and Phase J.2 incident
+  containment are recorded; the once-only local lock and the
+  redacted incident report are merged. Real I2V smoke is not
+  re-attempted without explicit operator authorization.
+- Phase J.3 I2V smoke harness fix is merged: the hand-written
+  PNG encoder is replaced by a deterministic pngjs-generated
+  fixture with offline pre-flight validation; the smoke harness
+  refuses to submit if the fixture is invalid or the once-only
+  lock is present.
 - Default smoke checks are non-consuming (dry run).
 
 ## Features
@@ -140,12 +149,18 @@ npm run dev
 - `npm run check:api` — offline API regression checks (no real
   MiniMax task created, never sets `CONFIRM_REAL_VIDEO=1`)
 - `npm run check:open-source`
+- `npm run check:minimax-auth` — auth-only Token Plan `remains`
+  check; never submits a video task
+- `npm run fixture:i2v:generate` — generate
+  `test/fixtures/i2v-smoke-first-frame.png` via `pngjs`
+- `npm run fixture:i2v:validate` — re-decode and assert
+  dimensions / size / aspect / MIME; exits 0 on `10/10 PASS`
 
 ## Env vars
 
 | Name | Description | Example |
 | --- | --- | --- |
-| `MINIMAX_API_KEY` | MiniMax API key for backend requests | `replace_with_your_minimax_token_plan_key` |
+| `MINIMAX_API_KEY` | MiniMax API key for backend requests | (your Token Plan subscription key; bare value, no `Bearer ` prefix, no surrounding quotes) |
 | `SITE_PASSCODE` | Simple page passcode | `change_me` |
 | `PORT` | Service port (default 8789) | `8789` |
 | `DATABASE_PATH` | SQLite path | `./data/minimax-video-studio.sqlite` |
@@ -647,9 +662,99 @@ responses and in the detail panel.
 
 ### Phase J (next, gated)
 
-Phase J would run **one** controlled real I2V smoke job end-to-end. It
-is intentionally not part of this release and will only run after
+Phase J would run **one** controlled real I2V smoke job end-to-end.
+It is intentionally not part of this release and will only run after
 explicit user authorization.
+
+Phase J is currently in the **containment** state: the first attempt
+returned `base_resp.status_code: 1004` from MiniMax, which was traced
+back to a literal placeholder in `.env::MINIMAX_API_KEY` (Phase J.1
+diagnosis). Once the operator replaced `.env::MINIMAX_API_KEY` with a
+real Token Plan subscription key, a follow-up Phase J attempt created
+two real I2V submits instead of the one authorized. Both submits were
+accepted by MiniMax, both failed at the local post-submit stage for
+the same reason (the previous hand-written PNG encoder produced a
+PNG that MiniMax's service-side decoder rejected with `invalid
+format / too much pixel data`), and the second submit was an
+execution-discipline violation during debugging. The Phase J.2
+incident report documents this without reproducing the real `task_id`s
+in any committed file. Phase J.3 (this release) replaces the broken
+PNG encoder with a deterministic pngjs-generated fixture and adds
+the corresponding offline pre-flight validation.
+
+## I2V smoke harness (Phase J.3)
+
+Phase J.3 replaces the previous hand-written PNG encoder in
+`scripts/smoke-image-to-video.js` with a deterministic PNG fixture
+that is produced by `scripts/generate-i2v-fixture.js` and validated by
+`scripts/validate-i2v-fixture.js`. The hand-written encoder was the
+root cause of the Phase J.2 incident (MiniMax service-side rejected
+the produced PNG with `invalid format / too much pixel data`). It
+has been removed from the I2V code path.
+
+### How it works
+
+1. **Fixture generator** — `npm run fixture:i2v:generate` writes a
+   deterministic 1024×768 RGBA PNG (abstract gradient, no people, no
+   text, no logos, no copyrighted content) to
+   `test/fixtures/i2v-smoke-first-frame.png`. The output is ~370 KB
+   and uses `pngjs` (now a devDependency) to produce a
+   decoder-valid PNG.
+2. **Fixture validator** — `npm run fixture:i2v:validate` re-decodes
+   the fixture and asserts: PNG magic bytes, `pngjs` decode succeeds,
+   width == 1024, height == 768, RGBA pixel buffer length ==
+   `width × height × 4`, file size ≤ 20 MB, short side ≥ 300 px,
+   aspect ratio ∈ [0.40, 2.50], and extension/MIME agree on
+   `image/png`. Exits 0 only on `10/10 PASS`.
+3. **Dry-run** (`npm run smoke:i2v`) — runs the fixture validator,
+   loads the fixture, and reports `fixture_exists` /
+   `fixture_validation` / `data_url_present` / `data_url_chars` /
+   `fixture_sha256_short` to console and to
+   `reports/local/i2v-smoke-dry-run.local.{md,json}` (gitignored).
+   The dry-run **never** logs the raw Data URL bytes.
+4. **Real mode** (`CONFIRM_REAL_VIDEO=1 CONFIRM_REAL_I2V=1 npm run
+   smoke:i2v`) — runs the same fixture pre-flight, then refuses to
+   submit if any of the following are true:
+   - fixture validation failed (`refused_by_fixture`);
+   - the once-only lock at `reports/local/i2v-real-smoke.lock` is
+     present (`refused_by_lock`).
+   The fixture, the lock, and the dry-run reports all live under
+   `reports/local/`, which is gitignored.
+
+### Once-only local lock (Phase J.2)
+
+Real I2V smoke is a one-shot operation per checkout. After a real
+submit (or after a real submit attempt that failed) the harness
+writes `reports/local/i2v-real-smoke.lock` with a masked task_id and
+the run timestamps. Any subsequent real-mode run exits immediately
+with `refused_by_lock` and a clear message pointing at the lock file.
+
+To re-authorize a real submit, **the operator must explicitly delete
+the lock file** — there is no CLI flag or env var that bypasses it.
+This is the mechanical guard against a recurrence of the Phase J.2
+execution-discipline incident.
+
+### Hard guarantees
+
+- `npm run smoke:i2v` in dry-run mode never creates a real I2V
+  task and never touches the lock file.
+- The fixture is an abstract gradient. It contains no people, no
+  text, no logos, and no copyrighted material.
+- The Data URL is built from the fixture bytes at request time and
+  is **never** echoed to logs, reports, or commit messages.
+- The harness never prints the real `MINIMAX_API_KEY`, the real
+  `Authorization` header, the real `task_id`, the real `file_id`,
+  the real `download_url`, or any base64 image content.
+
+### What is *not* in scope for Phase J.3
+
+- Phase J.3 does not run a real I2V smoke. It is a purely offline
+  harness fix.
+- Phase J.3 does not introduce subject-reference, first/last-frame,
+  Docker, CI/CD, or dependency-hygiene refactors. It only swaps
+  the I2V image source from a hand-written encoder to a deterministic
+  pngjs-generated fixture and adds the corresponding pre-flight
+  checks.
 
 ## Task status
 

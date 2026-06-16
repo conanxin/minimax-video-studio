@@ -17,7 +17,9 @@
     "import:local-smoke": "node scripts/import-local-smoke-to-db.js",
     "check:api": "node scripts/check-api-regression.js",
     "check:open-source": "node scripts/check-open-source.js",
-    "check:minimax-auth": "node scripts/check-minimax-auth.js"
+    "check:minimax-auth": "node scripts/check-minimax-auth.js",
+    "fixture:i2v:generate": "node scripts/generate-i2v-fixture.js",
+    "fixture:i2v:validate": "node scripts/validate-i2v-fixture.js"
   },
   "dependencies": {
     "axios": "^1.8.4",
@@ -33,6 +35,7 @@
     "@vitejs/plugin-react": "^4.3.3",
     "concurrently": "^9.1.3",
     "nodemon": "^3.1.9",
+    "pngjs": "^7.0.0",
     "vite": "^5.4.17"
   }
 }

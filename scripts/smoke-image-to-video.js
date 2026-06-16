@@ -1,6 +1,5 @@
 const fs = require('fs');
 const path = require('path');
-const zlib = require('zlib');
 const crypto = require('crypto');
 const { config } = require('dotenv');
 const { normalizeMiniMaxStatus } = require('../server/services/taskStore');
@@ -31,10 +30,27 @@ const I2V_REAL_LOCAL_JSON = path.resolve(I2V_REAL_LOCAL_DIR, 'phase-j-i2v-smoke.
 // are set AND the script proceeds to submit. The dry-run branch never
 // touches this lock.
 const I2V_REAL_LOCK_PATH = path.resolve(I2V_REAL_LOCAL_DIR, 'i2v-real-smoke.lock');
+// Phase J.3: I2V smoke now sources the first_frame_image from a
+// deterministic PNG fixture instead of a hand-written PNG encoder.
+// The fixture is produced by scripts/generate-i2v-fixture.js and
+// validated by scripts/validate-i2v-fixture.js. The hand-written
+// encoder was retired in Phase J.3 (see PHASE_J3 report) because
+// it produced PNGs that MiniMax's service-side decoder rejected
+// with "invalid format / too much pixel data".
+const I2V_FIXTURE_PATH = path.resolve(
+  process.cwd(),
+  'test',
+  'fixtures',
+  'i2v-smoke-first-frame.png',
+);
+const I2V_FIXTURE_WIDTH = 1024;
+const I2V_FIXTURE_HEIGHT = 768;
+const I2V_FIXTURE_MAX_BYTES = 20 * 1024 * 1024;
+const I2V_FIXTURE_MIN_SHORT_SIDE_PX = 300;
+const I2V_FIXTURE_ASPECT_MIN = 0.4;
+const I2V_FIXTURE_ASPECT_MAX = 2.5;
 const CHECK_INTERVAL_MS = 10_000;
 const MAX_ATTEMPTS = 60;
-const I2V_TEST_IMAGE_WIDTH = 1024;
-const I2V_TEST_IMAGE_HEIGHT = 768;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -53,103 +69,186 @@ function maskId(value) {
   return 'redacted';
 }
 
-// Build a minimal valid PNG without any external image dependency.
-// Produces a 3x2 RGB gradient that satisfies the MiniMax I2V
-// `data:image/png;base64,...` input contract. Strictly a placeholder
-// frame with no copyrighted content.
-function buildMinimalPngDataUrl(width = I2V_TEST_IMAGE_WIDTH, height = I2V_TEST_IMAGE_HEIGHT) {
-  if (width < 3 || height < 2) {
-    throw new Error('Test image dimensions too small for PNG encoding.');
+// Phase J.3 fixture loader: read the fixture file and build a
+// data:image/png;base64,... URL. The Data URL is built from the
+// fixture's bytes, NOT from a hand-written encoder. The returned
+// summary is safe to log; the full Data URL is intentionally NOT
+// logged because it would expose the entire image bytes.
+//
+// Returns:
+//   {
+//     ok: boolean,
+//     error: string | null,
+//     fixture_path, fixture_sha256_short, fixture_bytes,
+//     width, height, color_type, color_type_label,
+//     data_url_length,        // length in chars (NOT the URL itself)
+//     data_url_prefix,        // first ~24 chars only
+//     data_url_present: 'yes' | 'no',
+//   }
+async function loadI2VFixtureDataUrl() {
+  if (!fs.existsSync(I2V_FIXTURE_PATH)) {
+    return {
+      ok: false,
+      error: `fixture missing: ${path.relative(process.cwd(), I2V_FIXTURE_PATH)}`,
+    };
   }
-  // Use 3x2 base pattern repeated to fill the requested canvas.
-  const baseW = 3;
-  const baseH = 2;
-  const basePixels = [
-    [240, 200, 160],
-    [120, 80, 200],
-    [200, 220, 240],
-    [60, 40, 80],
-    [180, 200, 220],
-    [255, 255, 200],
-  ];
-  const rowBytes = baseW * 3;
-  const raw = Buffer.alloc(height * (1 + width * 3));
-  for (let y = 0; y < height; y += 1) {
-    raw[y * (1 + width * 3)] = 0; // PNG filter byte: None
-    for (let x = 0; x < width; x += 1) {
-      const srcY = y % baseH;
-      const srcX = x % baseW;
-      const src = basePixels[srcY * baseW + srcX];
-      const off = y * (1 + width * 3) + 1 + x * 3;
-      raw[off] = src[0];
-      raw[off + 1] = src[1];
-      raw[off + 2] = src[2];
-    }
+  const stat = fs.statSync(I2V_FIXTURE_PATH);
+  if (stat.size > I2V_FIXTURE_MAX_BYTES) {
+    return {
+      ok: false,
+      error: `fixture too large: ${stat.size} > ${I2V_FIXTURE_MAX_BYTES}`,
+    };
   }
-  // Build IDAT from baseH=2 raw rows repeated to height.
-  const idatRaw = Buffer.alloc(height * (1 + baseW * 3));
-  for (let y = 0; y < height; y += 1) {
-    idatRaw[y * (1 + baseW * 3)] = 0;
-    for (let x = 0; x < baseW; x += 1) {
-      const src = basePixels[y % baseH * baseW + x];
-      const off = y * (1 + baseW * 3) + 1 + x * 3;
-      idatRaw[off] = src[0];
-      idatRaw[off + 1] = src[1];
-      idatRaw[off + 2] = src[2];
-    }
+  const buf = fs.readFileSync(I2V_FIXTURE_PATH);
+  // Magic bytes
+  const expectedMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(expectedMagic)) {
+    return {
+      ok: false,
+      error: 'fixture missing PNG magic bytes',
+    };
   }
-  // Avoid double-suppress unused warnings.
-  void rowBytes;
-  void raw;
-  const idatData = zlib.deflateSync(idatRaw);
-  // CRC32 over chunk type + data
-  function chunk(type, data) {
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(data.length, 0);
-    const typeBuf = Buffer.from(type, 'ascii');
-    const crcInput = Buffer.concat([typeBuf, data]);
-    const crc = Buffer.alloc(4);
-    crc.writeUInt32BE(crc32(crcInput) >>> 0, 0);
-    return Buffer.concat([len, typeBuf, data, crc]);
+  // Dimension / shape checks (decode IHDR; we do not need to
+  // fully decode the IDAT for the harness, but the validator
+  // script does that as a separate, stricter check).
+  // Width is at offset 16, height at offset 20, big-endian uint32.
+  if (buf.length < 24) {
+    return { ok: false, error: 'fixture too small to parse IHDR' };
   }
-  function crc32(buf) {
-    let table = crc32.table;
-    if (!table) {
-      table = new Uint32Array(256);
-      for (let n = 0; n < 256; n += 1) {
-        let c = n;
-        for (let k = 0; k < 8; k += 1) {
-          c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-        }
-        table[n] = c >>> 0;
-      }
-      crc32.table = table;
-    }
-    let c = 0xffffffff;
-    for (let i = 0; i < buf.length; i += 1) {
-      c = (table[(c ^ buf[i]) & 0xff] ^ (c >>> 8)) >>> 0;
-    }
-    return (c ^ 0xffffffff) >>> 0;
+  const width = buf.readUInt32BE(16);
+  const height = buf.readUInt32BE(20);
+  if (width !== I2V_FIXTURE_WIDTH) {
+    return {
+      ok: false,
+      error: `fixture width mismatch: expected ${I2V_FIXTURE_WIDTH}, got ${width}`,
+    };
   }
-  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(baseW, 0);
-  ihdr.writeUInt32BE(baseH, 4);
-  ihdr[8] = 8;  // bit depth
-  ihdr[9] = 2;  // color type RGB
-  ihdr[10] = 0; // compression
-  ihdr[11] = 0; // filter
-  ihdr[12] = 0; // interlace
-  const iend = Buffer.alloc(0);
-  const png = Buffer.concat([sig, chunk('IHDR', ihdr), chunk('IDAT', idatData), chunk('IEND', iend)]);
-  return `data:image/png;base64,${png.toString('base64')}`;
+  if (height !== I2V_FIXTURE_HEIGHT) {
+    return {
+      ok: false,
+      error: `fixture height mismatch: expected ${I2V_FIXTURE_HEIGHT}, got ${height}`,
+    };
+  }
+  const shortSide = Math.min(width, height);
+  const longSide = Math.max(width, height);
+  const aspect = shortSide > 0 ? longSide / shortSide : 0;
+  if (shortSide < I2V_FIXTURE_MIN_SHORT_SIDE_PX) {
+    return {
+      ok: false,
+      error: `fixture short side ${shortSide}px < ${I2V_FIXTURE_MIN_SHORT_SIDE_PX}px`,
+    };
+  }
+  if (aspect < I2V_FIXTURE_ASPECT_MIN || aspect > I2V_FIXTURE_ASPECT_MAX) {
+    return {
+      ok: false,
+      error: `fixture aspect ${aspect.toFixed(3)} outside [${I2V_FIXTURE_ASPECT_MIN}, ${I2V_FIXTURE_ASPECT_MAX}]`,
+    };
+  }
+  // Color type at offset 25: 2 = RGB, 6 = RGBA. Both are valid PNG
+  // color types for an I2V first_frame_image.
+  const colorType = buf[25];
+  const colorTypeLabel =
+    colorType === 6 ? 'RGBA' : colorType === 2 ? 'RGB' : `unknown(${colorType})`;
+
+  const base64 = buf.toString('base64');
+  const dataUrl = `data:image/png;base64,${base64}`;
+  const sha256Short = crypto
+    .createHash('sha256')
+    .update(buf)
+    .digest('hex')
+    .slice(0, 8);
+  return {
+    ok: true,
+    error: null,
+    fixture_path: path.relative(process.cwd(), I2V_FIXTURE_PATH),
+    fixture_sha256_short: sha256Short,
+    fixture_bytes: buf.length,
+    width,
+    height,
+    color_type: colorType,
+    color_type_label: colorTypeLabel,
+    data_url_length: dataUrl.length,
+    // First 24 chars only: 'data:image/png;base64,' prefix
+    data_url_prefix: dataUrl.slice(0, 24),
+    data_url_present: 'yes',
+    // NOT exposed in any log path: dataUrl itself.
+    data_url_for_payload_only: dataUrl,
+  };
 }
 
-function buildI2VPayload() {
+// Same checks, but stricter: actually decodes the PNG via pngjs so
+// we know the IDAT payload is well-formed, not just the IHDR header.
+// Used by the validator script and by smoke:i2v dry-run as a fast
+// pre-flight.
+async function validateI2VFixture() {
+  if (!fs.existsSync(I2V_FIXTURE_PATH)) {
+    return { ok: false, checks: [{ name: 'fixture exists', ok: false }] };
+  }
+  const checks = [];
+  const buf = fs.readFileSync(I2V_FIXTURE_PATH);
+  const expectedMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const magicOk = buf.length >= 8 && buf.subarray(0, 8).equals(expectedMagic);
+  checks.push({ name: 'PNG magic bytes', ok: magicOk });
+  if (!magicOk) return { ok: false, checks };
+
+  let png = null;
+  try {
+    // Lazy require pngjs so the script stays runnable in environments
+    // without the devDependency (e.g. legacy CI). In that case the
+    // harness falls back to IHDR-only checks.
+    const { PNG } = require('pngjs');
+    png = PNG.sync.read(buf);
+    checks.push({ name: 'pngjs decode', ok: true });
+  } catch (err) {
+    checks.push({ name: 'pngjs decode', ok: false, detail: err.message });
+    return { ok: false, checks };
+  }
+
+  checks.push({
+    name: `width == ${I2V_FIXTURE_WIDTH}`,
+    ok: png.width === I2V_FIXTURE_WIDTH,
+    detail: `got=${png.width}`,
+  });
+  checks.push({
+    name: `height == ${I2V_FIXTURE_HEIGHT}`,
+    ok: png.height === I2V_FIXTURE_HEIGHT,
+    detail: `got=${png.height}`,
+  });
+  const expectedPixels = png.width * png.height * 4;
+  checks.push({
+    name: 'RGBA pixel buffer length',
+    ok: png.data && png.data.length === expectedPixels,
+    detail: `expected=${expectedPixels} actual=${png.data ? png.data.length : 0}`,
+  });
+  checks.push({
+    name: 'file size <= 20MB',
+    ok: buf.length <= I2V_FIXTURE_MAX_BYTES,
+    detail: `bytes=${buf.length}`,
+  });
+  const shortSide = Math.min(png.width, png.height);
+  const aspect =
+    shortSide > 0 ? Math.max(png.width, png.height) / shortSide : 0;
+  checks.push({
+    name: 'short side >= 300px',
+    ok: shortSide >= I2V_FIXTURE_MIN_SHORT_SIDE_PX,
+    detail: `short_side=${shortSide}`,
+  });
+  checks.push({
+    name: 'aspect ratio in [0.40, 2.50]',
+    ok: aspect >= I2V_FIXTURE_ASPECT_MIN && aspect <= I2V_FIXTURE_ASPECT_MAX,
+    detail: `aspect=${aspect.toFixed(3)}`,
+  });
+
+  const ok = checks.every((c) => c.ok);
+  return { ok, checks };
+}
+
+function buildI2VPayload(dataUrl, sha256Short) {
   return {
     model: i2vModelConfig.defaults.model,
-    prompt: 'A calm abstract gradient slowly blooming outward, soft pastel lighting, no people, no text, no logos, gentle cinematic motion, 6 seconds.',
-    first_frame_image: buildMinimalPngDataUrl(),
+    prompt:
+      'A calm abstract gradient slowly blooming outward, soft pastel lighting, no people, no text, no logos, gentle cinematic motion, 6 seconds.',
+    first_frame_image: dataUrl,
     duration: i2vModelConfig.defaults.duration,
     resolution: i2vModelConfig.defaults.resolution,
     prompt_optimizer: i2vModelConfig.defaults.prompt_optimizer,
@@ -157,21 +256,28 @@ function buildI2VPayload() {
 }
 
 function payloadSummaryForLog(payload) {
+  const imageBytes = payload.first_frame_image
+    ? payload.first_frame_image.length
+    : 0;
   return {
     model: payload.model,
     prompt: payload.prompt,
     duration: payload.duration,
     resolution: payload.resolution,
     prompt_optimizer: payload.prompt_optimizer,
-    first_frame_image_kind: payload.first_frame_image.startsWith('data:image/png;base64,')
-      ? 'data_url_png'
-      : 'unknown',
-    first_frame_image_bytes_estimated: payload.first_frame_image.length,
-    first_frame_image_sha256_short: crypto
-      .createHash('sha256')
-      .update(payload.first_frame_image)
-      .digest('hex')
-      .slice(0, 8),
+    first_frame_image_kind: payload.first_frame_image
+      ? payload.first_frame_image.startsWith('data:image/png;base64,')
+        ? 'data_url_png'
+        : 'unknown'
+      : 'absent',
+    first_frame_image_bytes_estimated: imageBytes,
+    first_frame_image_sha256_short: payload.first_frame_image
+      ? crypto
+          .createHash('sha256')
+          .update(payload.first_frame_image)
+          .digest('hex')
+          .slice(0, 8)
+      : null,
   };
 }
 
@@ -186,8 +292,8 @@ async function persistSmokeTaskProgress(task) {
   return updateTaskByTaskId(task.task_id, patch);
 }
 
-async function runRealI2VSmoke(context) {
-  const payload = buildI2VPayload();
+async function runRealI2VSmoke(context, dataUrl, fixtureSha256Short) {
+  const payload = buildI2VPayload(dataUrl, fixtureSha256Short);
   context.payloadSummary = payloadSummaryForLog(payload);
 
   const created = await createImageToVideo(payload);
@@ -209,7 +315,7 @@ async function runRealI2VSmoke(context) {
     input_image_present: true,
     input_image_type: 'data_url',
     input_image_sha256_short: context.payloadSummary.first_frame_image_sha256_short,
-    input_image_summary: 'PNG placeholder frame, no copyrighted content',
+    input_image_summary: 'Fixture-driven first frame, abstract gradient, no copyrighted content',
     status: normalizeMiniMaxStatus(created.status) || 'Queueing',
     file_id: created.file_id || null,
     download_url: created.download_url || null,
@@ -285,14 +391,25 @@ by git. It is a machine-local breadcrumb only.
 - fail_reason: ${safeText(context.failReason)}
 - real_quota_consumed: ${safeText(context.chargeUsed)}
 
+## Fixture (Phase J.3)
+- fixture_path: ${safeText(context.fixture && context.fixture.fixture_path)}
+- fixture_exists: ${context.fixture ? (context.fixture.error ? 'no' : 'yes') : 'unknown'}
+- fixture_validation: ${safeText(context.fixtureValidation)}
+- fixture_bytes: ${context.fixture ? safeText(context.fixture.fixture_bytes) : 'N/A'}
+- fixture_sha256_short: ${context.fixture ? safeText(context.fixture.fixture_sha256_short) : 'N/A'}
+- fixture_width: ${context.fixture ? safeText(context.fixture.width) : 'N/A'}
+- fixture_height: ${context.fixture ? safeText(context.fixture.height) : 'N/A'}
+- fixture_color_type: ${context.fixture ? safeText(context.fixture.color_type_label) : 'N/A'}
+- data_url_present: ${context.fixture ? safeText(context.fixture.data_url_present) : 'no'}
+
 ## Payload summary (no image data)
 ${context.payloadSummary ? JSON.stringify(context.payloadSummary, null, 2) : 'N/A'}
 
 ## Note
 - This file is regenerated on every dry-run.
-- The public \`docs/PHASE_J_REAL_I2V_SMOKE_REPORT.md\` is not touched
-  by the smoke script. It is updated only by a dedicated phase with
-  masked identifiers.
+- The public \`docs/PHASE_J3_I2V_SMOKE_HARNESS_FIX_REPORT.md\` is
+  not touched by the smoke script. It is updated only by a
+  dedicated phase with masked identifiers.
 `;
 }
 
@@ -332,6 +449,9 @@ async function writeDryRunReports(context) {
   console.log(`  - final_status: ${safeText(context.finalStatus)}`);
   console.log(`  - real_quota_consumed: ${safeText(context.chargeUsed)}`);
   console.log(`  - fail_reason: ${safeText(context.failReason)}`);
+  console.log(`  - fixture_path: ${context.fixture ? safeText(context.fixture.fixture_path) : 'N/A'}`);
+  console.log(`  - fixture_validation: ${safeText(context.fixtureValidation)}`);
+  console.log(`  - data_url_present: ${context.fixture ? safeText(context.fixture.data_url_present) : 'no'}`);
   console.log(`  - payload_summary: ${JSON.stringify(context.payloadSummary || {})}`);
   console.log(`  - local_md: ${I2V_DRY_RUN_LOCAL_MD}`);
   console.log(`  - local_json: ${I2V_DRY_RUN_LOCAL_JSON}`);
@@ -418,6 +538,30 @@ mechanically impossible unless the operator explicitly deletes it.
 `;
 }
 
+function renderFixtureInvalidReport(fixtureInfo) {
+  return `# I2V Smoke - Refused: Fixture Invalid
+
+The I2V smoke fixture is missing, unreadable, or fails one or
+more pre-flight checks. The real I2V branch refuses to proceed
+because sending an invalid PNG to MiniMax would consume video
+quota for a guaranteed failure (the Phase J.2 incident root
+cause).
+
+## Fixture pre-flight
+
+- fixture_path: ${fixtureInfo ? safeText(fixtureInfo.fixture_path) : 'N/A'}
+- fixture_error: ${fixtureInfo && fixtureInfo.error ? safeText(fixtureInfo.error) : 'unknown'}
+
+## How to fix
+
+1. Run \`npm run fixture:i2v:generate\` to (re)create the fixture.
+2. Run \`npm run fixture:i2v:validate\` to confirm it is healthy.
+3. Re-run \`npm run smoke:i2v\`.
+
+Do not bypass the fixture check by editing \`scripts/smoke-image-to-video.js\`.
+`;
+}
+
 async function main() {
   const start = new Date().toISOString();
   const report = {
@@ -433,23 +577,132 @@ async function main() {
     startedAt: start,
     finishedAt: start,
     payloadSummary: null,
+    fixture: null,
+    fixtureValidation: 'skipped',
   };
 
   const keyExists = Boolean(process.env.MINIMAX_API_KEY);
   const confirmRealVideo = String(process.env.CONFIRM_REAL_VIDEO || '').trim() === '1';
   const confirmRealI2V = String(process.env.CONFIRM_REAL_I2V || '').trim() === '1';
+  const testLockOnly =
+    String(process.env.I2V_SMOKE_TEST_LOCK_ONLY || '').trim() === '1';
 
   console.log('MiniMax I2V smoke test:');
   console.log(`MINIMAX_API_KEY exists: ${keyExists ? 'yes' : 'no'}`);
   console.log(`API base: ${process.env.MINIMAX_API_BASE || 'https://api.minimaxi.com'}`);
 
   if (!confirmRealVideo || !confirmRealI2V) {
+    // DRY-RUN branch.
+    // 1. Validate fixture (strict, pngjs decode).
+    const fixture = await loadI2VFixtureDataUrl();
+    report.fixture = {
+      fixture_path: fixture.fixture_path,
+      fixture_sha256_short: fixture.fixture_sha256_short,
+      fixture_bytes: fixture.fixture_bytes,
+      width: fixture.width,
+      height: fixture.height,
+      color_type_label: fixture.color_type_label,
+      data_url_present: fixture.data_url_present,
+      error: fixture.error,
+    };
+    const validation = await validateI2VFixture();
+    report.fixtureValidation = validation.ok
+      ? 'PASS'
+      : `FAIL (${validation.checks.filter((c) => !c.ok).map((c) => c.name).join(', ')})`;
     report.failReason =
       'Skipped by default. Set CONFIRM_REAL_VIDEO=1 and CONFIRM_REAL_I2V=1 and run again for one controlled real call.';
     report.finishedAt = new Date().toISOString();
-    report.finalStatus = 'skipped';
-    report.payloadSummary = payloadSummaryForLog(buildI2VPayload());
+    report.finalStatus = validation.ok ? 'dry_run_ok' : 'dry_run_fixture_invalid';
+    // Build payload summary from the actual fixture so the dry-run
+    // exercise is real (it still does NOT call MiniMax).
+    if (validation.ok && fixture.ok) {
+      report.payloadSummary = payloadSummaryForLog(
+        buildI2VPayload(fixture.data_url_for_payload_only, fixture.fixture_sha256_short),
+      );
+      // Defensive: strip the full data URL from the JSON we write
+      // to reports/local/. The summary exposes length / sha8 / kind
+      // / bytes but never the bytes themselves.
+      if (report.payloadSummary && report.payloadSummary.first_frame_image_bytes_estimated) {
+        delete report.payloadSummary.first_frame_image_bytes_estimated;
+        report.payloadSummary.first_frame_image_data_url_chars = fixture.data_url_length;
+      }
+    } else {
+      report.payloadSummary = {
+        first_frame_image_kind: 'absent',
+        fixture_error: fixture.error || 'unknown',
+      };
+    }
     await writeDryRunReports(report);
+    return;
+  }
+
+  // REAL branch.
+  // I2V_SMOKE_TEST_LOCK_ONLY is a check:api-only path: it forces
+  // the script through the lock-blocked code path with no remote
+  // call. It MUST NEVER be combined with the actual remote call.
+  if (testLockOnly) {
+    const fixture = await loadI2VFixtureDataUrl();
+    report.fixture = {
+      fixture_path: fixture.fixture_path,
+      fixture_sha256_short: fixture.fixture_sha256_short,
+      fixture_bytes: fixture.fixture_bytes,
+      width: fixture.width,
+      height: fixture.height,
+      color_type_label: fixture.color_type_label,
+      data_url_present: fixture.data_url_present,
+      error: fixture.error,
+    };
+    const validation = await validateI2VFixture();
+    report.fixtureValidation = validation.ok ? 'PASS' : 'FAIL';
+    if (!validation.ok) {
+      report.failReason = 'Fixture validation failed; refuse to proceed.';
+      report.finalStatus = 'refused_by_fixture';
+      report.finishedAt = new Date().toISOString();
+      await fs.promises.mkdir(I2V_REAL_LOCAL_DIR, { recursive: true });
+      const blockedPath = path.resolve(
+        I2V_REAL_LOCAL_DIR,
+        'i2v-smoke-blocked-by-fixture.local.md',
+      );
+      await fs.promises.writeFile(blockedPath, renderFixtureInvalidReport(report.fixture), 'utf8');
+      console.error(report.failReason);
+      console.error(`Block report: ${blockedPath}`);
+      await writeRealLocalReports(report);
+      await writeDryRunReports(report);
+      return;
+    }
+    // Synthetic lock for the test path: only present if test mode
+    // AND the harness placed one there for us. The actual check:api
+    // step creates this file before invoking the script.
+    const existingLock = await readI2VRealLock();
+    if (existingLock) {
+      report.failReason =
+        'Refused: real I2V smoke has already been run in this checkout. ' +
+        'Delete reports/local/i2v-real-smoke.lock to re-authorize.';
+      report.createdStatus = 'not_created';
+      report.finalStatus = 'refused_by_lock';
+      report.chargeUsed = 'No';
+      report.finishedAt = new Date().toISOString();
+      await fs.promises.mkdir(I2V_REAL_LOCAL_DIR, { recursive: true });
+      const blockedPath = path.resolve(
+        I2V_REAL_LOCAL_DIR,
+        'i2v-smoke-blocked-by-lock.local.md',
+      );
+      await fs.promises.writeFile(blockedPath, renderLockBlockedReport(existingLock), 'utf8');
+      console.error(report.failReason);
+      console.error(`Existing lock: ${I2V_REAL_LOCK_PATH}`);
+      console.error(`Block report: ${blockedPath}`);
+      await writeRealLocalReports(report);
+      await writeDryRunReports(report);
+      return;
+    }
+    // No lock present: test mode reached the end without firing.
+    report.failReason = 'I2V_SMOKE_TEST_LOCK_ONLY=1 set but no lock present';
+    report.finalStatus = 'refused_by_test_mode_no_lock';
+    report.chargeUsed = 'No';
+    report.finishedAt = new Date().toISOString();
+    await writeRealLocalReports(report);
+    await writeDryRunReports(report);
+    process.exitCode = 2;
     return;
   }
 
@@ -459,6 +712,44 @@ async function main() {
     report.finalStatus = 'failed';
     report.finishedAt = new Date().toISOString();
     report.chargeUsed = 'No';
+    await writeRealLocalReports(report);
+    await writeDryRunReports(report);
+    return;
+  }
+
+  // Phase J.3 fixture pre-flight: refuse to submit if the fixture
+  // is missing or invalid. This prevents the Phase J.2 incident
+  // class (sending an invalid PNG to MiniMax) from recurring.
+  const fixture = await loadI2VFixtureDataUrl();
+  report.fixture = {
+    fixture_path: fixture.fixture_path,
+    fixture_sha256_short: fixture.fixture_sha256_short,
+    fixture_bytes: fixture.fixture_bytes,
+    width: fixture.width,
+    height: fixture.height,
+    color_type_label: fixture.color_type_label,
+    data_url_present: fixture.data_url_present,
+    error: fixture.error,
+  };
+  const validation = await validateI2VFixture();
+  report.fixtureValidation = validation.ok ? 'PASS' : 'FAIL';
+  if (!validation.ok) {
+    report.failReason = `Refused: fixture validation failed (${validation.checks
+      .filter((c) => !c.ok)
+      .map((c) => c.name)
+      .join(', ')})`;
+    report.createdStatus = 'not_created';
+    report.finalStatus = 'refused_by_fixture';
+    report.chargeUsed = 'No';
+    report.finishedAt = new Date().toISOString();
+    await fs.promises.mkdir(I2V_REAL_LOCAL_DIR, { recursive: true });
+    const blockedPath = path.resolve(
+      I2V_REAL_LOCAL_DIR,
+      'i2v-smoke-blocked-by-fixture.local.md',
+    );
+    await fs.promises.writeFile(blockedPath, renderFixtureInvalidReport(report.fixture), 'utf8');
+    console.error(report.failReason);
+    console.error(`Block report: ${blockedPath}`);
     await writeRealLocalReports(report);
     await writeDryRunReports(report);
     return;
@@ -494,13 +785,11 @@ async function main() {
   report.requestTaskStarted = 'Yes';
 
   try {
-    await runRealI2VSmoke(report);
-    // Create the once-only lock after a successful submit so that
-    // any subsequent attempt (including a debugging replay) cannot
-    // submit a second time without the operator deleting the lock.
-    // We write the lock with the masked task_id and the run start
-    // timestamp; we also record the finished_at so the next attempt
-    // can show when the previous one ended.
+    await runRealI2VSmoke(
+      report,
+      fixture.data_url_for_payload_only,
+      fixture.fixture_sha256_short,
+    );
     await writeI2VRealLock({
       created_at: start,
       finished_at: report.finishedAt,
@@ -517,9 +806,6 @@ async function main() {
     report.finalStatus = 'failed';
     report.failReason = error.message || 'unknown error';
     console.error(error.message || error);
-    // Even on failure, write the lock: the operator must explicitly
-    // delete it before any second attempt. This is the whole point
-    // of the once-only guard.
     try {
       await writeI2VRealLock({
         created_at: start,
