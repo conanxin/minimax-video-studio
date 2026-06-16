@@ -16,10 +16,12 @@ const {
 
 config();
 
-const PHASE_A_REPORT_PATH = path.resolve(process.cwd(), 'docs', 'PHASE_A_API_SMOKE_REPORT.md');
-const PHASE_C1_LOCAL_DIR = path.resolve(process.cwd(), 'reports', 'local');
-const PHASE_C1_LOCAL_MD = path.resolve(PHASE_C1_LOCAL_DIR, 'phase-c1-real-smoke.local.md');
-const PHASE_C1_LOCAL_JSON = path.resolve(PHASE_C1_LOCAL_DIR, 'phase-c1-real-smoke.local.json');
+const SMOKE_DRY_RUN_LOCAL_DIR = path.resolve(process.cwd(), 'reports', 'local');
+const SMOKE_DRY_RUN_LOCAL_MD = path.resolve(SMOKE_DRY_RUN_LOCAL_DIR, 'smoke-dry-run.local.md');
+const SMOKE_DRY_RUN_LOCAL_JSON = path.resolve(SMOKE_DRY_RUN_LOCAL_DIR, 'smoke-dry-run.local.json');
+const SMOKE_REAL_LOCAL_DIR = path.resolve(process.cwd(), 'reports', 'local');
+const SMOKE_REAL_LOCAL_MD = path.resolve(SMOKE_REAL_LOCAL_DIR, 'phase-c1-real-smoke.local.md');
+const SMOKE_REAL_LOCAL_JSON = path.resolve(SMOKE_REAL_LOCAL_DIR, 'phase-c1-real-smoke.local.json');
 const CHECK_INTERVAL_MS = 10_000;
 const MAX_ATTEMPTS = 60;
 
@@ -58,42 +60,29 @@ function isStatusTerminal(status) {
   return normalized === 'Success' || normalized === 'Fail';
 }
 
-function renderPhaseAReport(context) {
-  return `# Phase A - MiniMax API Smoke Test Report
+function renderDryRunReport(context) {
+  return `# Smoke dry-run (local)
 
-## What was verified
-- Read env and confirm MINIMAX_API_KEY exists.
-- Call create/query/retrieve flow for text-to-video.
-- Output task_id, status, file_id, download_url and fail_reason.
+This file is written by \`scripts/smoke-text-to-video.js\` in
+\`CONFIRM_REAL_VIDEO != 1\` mode. It is intentionally stored under
+\`reports/local/\` so it is **not** picked up by git. It is a
+machine-local breadcrumb only.
 
-## Why smoke test first
-- Validate the network and request/response chain quickly.
-- Confirm integration points and error handling before full UI acceptance.
-
-## Environment variables used
-- MINIMAX_API_KEY: ${safeText(maskApiKey(process.env.MINIMAX_API_KEY))}
-- MINIMAX_API_BASE: ${safeText(process.env.MINIMAX_API_BASE || 'https://api.minimaxi.com')}
-- PORT: ${safeText(process.env.PORT)}
-- DATABASE_PATH: ${safeText(process.env.DATABASE_PATH)}
-- CONFIRM_REAL_VIDEO: ${safeText(process.env.CONFIRM_REAL_VIDEO)}
-
-## Execution result
-- Requested execution: ${safeText(context.created)}
-- Creation status: ${safeText(context.createdStatus)}
-- Final status: ${safeText(context.finalStatus)}
-- task_id: ${safeText(context.taskId)}
-- file_id: ${safeText(context.fileId)}
-- download_url: ${safeText(context.downloadUrl)}
+## Snapshot
+- run_at: ${safeText(context.startedAt)}
+- finished_at: ${safeText(context.finishedAt)}
+- confirm_real_video: ${safeText(process.env.CONFIRM_REAL_VIDEO || '0')}
+- api_base: ${safeText(process.env.MINIMAX_API_BASE || 'https://api.minimaxi.com')}
+- api_key_present: ${process.env.MINIMAX_API_KEY ? 'yes (masked elsewhere)' : 'no'}
+- final_status: ${safeText(context.finalStatus)}
 - fail_reason: ${safeText(context.failReason)}
-- Real quota consumed: ${safeText(context.chargeUsed)}
+- real_quota_consumed: ${safeText(context.chargeUsed)}
 
-## Key leakage check
-- This report only prints masked key fragments.
-- Full API key was not printed to logs or report.
-
-## Time
-- Started: ${formatDateTime(context.startedAt)}
-- Finished: ${formatDateTime(context.finishedAt)}
+## Note
+- This file is regenerated on every dry-run.
+- The public \`docs/PHASE_A_API_SMOKE_REPORT.md\` is no longer
+  touched by the smoke script. It is a historical artifact and
+  is updated only by a dedicated phase.
 `;
 }
 
@@ -176,23 +165,31 @@ function buildPhaseC1PublicReport(context) {
 `;
 }
 
-async function writePhaseAReport(context) {
-  const content = renderPhaseAReport(context);
-  await fs.promises.mkdir(path.dirname(PHASE_A_REPORT_PATH), { recursive: true });
-  await fs.promises.writeFile(PHASE_A_REPORT_PATH, content, 'utf8');
-  console.log(`Smoke report saved: ${PHASE_A_REPORT_PATH}`);
+async function writeDryRunReports(context) {
+  // Local markdown + JSON. Both are gitignored under reports/local/
+  // (see .gitignore). The public docs/ tree is never touched in
+  // dry-run mode.
+  await fs.promises.mkdir(SMOKE_DRY_RUN_LOCAL_DIR, { recursive: true });
+  await fs.promises.writeFile(SMOKE_DRY_RUN_LOCAL_MD, renderDryRunReport(context), 'utf8');
+  await fs.promises.writeFile(SMOKE_DRY_RUN_LOCAL_JSON, JSON.stringify(context, null, 2), 'utf8');
+  console.log(`Smoke dry-run console summary:`);
+  console.log(`  - final_status: ${safeText(context.finalStatus)}`);
+  console.log(`  - real_quota_consumed: ${safeText(context.chargeUsed)}`);
+  console.log(`  - fail_reason: ${safeText(context.failReason)}`);
+  console.log(`  - local_md: ${SMOKE_DRY_RUN_LOCAL_MD}`);
+  console.log(`  - local_json: ${SMOKE_DRY_RUN_LOCAL_JSON}`);
 }
 
 async function writePhaseC1LocalAndConsole(context, publicReportPath) {
-  await fs.promises.mkdir(PHASE_C1_LOCAL_DIR, { recursive: true });
-  await fs.promises.writeFile(PHASE_C1_LOCAL_MD, renderPhaseC1LocalReport(context), 'utf8');
-  await fs.promises.writeFile(PHASE_C1_LOCAL_JSON, JSON.stringify(context, null, 2), 'utf8');
+  await fs.promises.mkdir(SMOKE_REAL_LOCAL_DIR, { recursive: true });
+  await fs.promises.writeFile(SMOKE_REAL_LOCAL_MD, renderPhaseC1LocalReport(context), 'utf8');
+  await fs.promises.writeFile(SMOKE_REAL_LOCAL_JSON, JSON.stringify(context, null, 2), 'utf8');
   if (publicReportPath) {
     await fs.promises.writeFile(publicReportPath, buildPhaseC1PublicReport(context), 'utf8');
     console.log(`Public C1 report saved: ${publicReportPath}`);
   }
-  console.log(`Local C1 report saved: ${PHASE_C1_LOCAL_MD}`);
-  console.log(`Local C1 JSON saved: ${PHASE_C1_LOCAL_JSON}`);
+  console.log(`Local C1 report saved: ${SMOKE_REAL_LOCAL_MD}`);
+  console.log(`Local C1 JSON saved: ${SMOKE_REAL_LOCAL_JSON}`);
 }
 
 function buildPayloadFromEnv() {
@@ -321,7 +318,7 @@ async function main() {
       'Skipped by default. Set CONFIRM_REAL_VIDEO=1 and run again for one controlled real call.';
     report.finishedAt = new Date().toISOString();
     report.finalStatus = 'skipped';
-    await writePhaseAReport(report);
+    await writeDryRunReports(report);
     return;
   }
 
@@ -334,7 +331,7 @@ async function main() {
     await writePhaseC1LocalAndConsole(report, isPhaseC1
       ? path.resolve(process.cwd(), 'docs', 'PHASE_C1_REAL_SMOKE_REPORT.md')
       : null);
-    await writePhaseAReport(report);
+    await writeDryRunReports(report);
     return;
   }
 
@@ -387,7 +384,7 @@ async function main() {
     await writePhaseC1LocalAndConsole(report, isPhaseC1
       ? path.resolve(process.cwd(), 'docs', 'PHASE_C1_REAL_SMOKE_REPORT.md')
       : null);
-    await writePhaseAReport(report);
+    await writeDryRunReports(report);
     console.log(`Final status: ${report.finalStatus}`);
     console.log('Smoke flow completed.');
     if (report.taskId !== 'N/A') {

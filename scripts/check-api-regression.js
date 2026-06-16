@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
- * Phase E + Phase F + Phase G - API regression check script.
+ * Phase E + Phase F + Phase G + Phase H - API regression check script.
  *
  * Goals:
  *  1. Boot the backend, run a small regression suite, then shut it down.
  *  2. Cover auth, validation, polling-config endpoint, the file-refresh
  *     endpoint (only if a local Success + file_id task exists), the
  *     Phase F task-list filtering, pagination, and search behaviour,
- *     and the Phase G download-link freshness contract.
+ *     the Phase G download-link freshness contract, and the Phase H
+ *     error-classification contract.
  *  3. NEVER call /api/video/create with a valid payload (that would consume
  *     MiniMax quota). Only the rejection paths are exercised.
  *  4. NEVER read, log, or print MINIMAX_API_KEY.
@@ -29,7 +30,7 @@ const { config } = require('dotenv');
 config();
 
 const ROOT = path.resolve(__dirname, '..');
-const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-g-api-regression.report.txt');
+const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-h-api-regression.report.txt');
 
 const PORT = Number(process.env.PORT) || 8789;
 const SITE_PASSCODE = String(process.env.SITE_PASSCODE || 'change_me').trim();
@@ -57,7 +58,17 @@ function recordResult(name, ok, detail) {
 
 function assertNoKeyLeakage(payload, label) {
   const text = JSON.stringify(payload || {});
-  if (text.includes('MINIMAX_API_KEY') || /eyJ[A-Za-z0-9_-]{20,}/.test(text)) {
+  // A literal value or full Bearer token. The string
+  // "MINIMAX_API_KEY" by itself (as a config name) is NOT a
+  // leak; only an actual key value or JWT-style token is.
+  const looksLikeValue = (s) => /^[A-Za-z0-9_-]{20,}$/.test(s);
+  const hasKeyValue = text
+    .split(/[",{}\s]+/)
+    .filter((tok) => tok && tok !== 'MINIMAX_API_KEY')
+    .some((tok) => looksLikeValue(tok) && /eyJ/i.test(tok));
+  const hasJwt = /eyJ[A-Za-z0-9_-]{20,}/.test(text);
+  const hasEnvAssignment = /MINIMAX_API_KEY\s*[:=]\s*['"]?[A-Za-z0-9_-]{16,}['"]?/.test(text);
+  if (hasKeyValue || hasJwt || hasEnvAssignment) {
     recordResult(`${label}: no key leak`, false, 'response body contained a key fragment');
     return false;
   }
@@ -75,13 +86,15 @@ function assertNoDownloadUrlLeak(payload, label) {
   return true;
 }
 
-// Phase G: write deterministic local SQLite seed rows that exercise
-// the freshness state machine. All values are obviously fake: ids use
-// the `local-seed-g-` prefix, file_ids use `file-seed-g-`, and
-// download_url values are short local placeholders that the script
-// never logs verbatim. The DB file is gitignored; nothing here is
-// written to a public report.
-function seedFreshnessFixtures() {
+// Phase G + Phase H: write deterministic local SQLite seed rows
+// that exercise the freshness state machine and the
+// error-classification state machine. All values are obviously
+// fake: ids use the `local-seed-g-` / `local-seed-h-` prefix,
+// file_ids use `file-seed-*-*`, and download_url values are
+// short local placeholders that the script never logs verbatim.
+// The DB file is gitignored; nothing here is written to a public
+// report.
+function seedFixtures() {
   return new Promise((resolve, reject) => {
     const sqlite3 = require('sqlite3');
     const { open } = require('sqlite');
@@ -121,40 +134,88 @@ function seedFreshnessFixtures() {
         const now = Date.now();
         const isoOffset = (hours) => new Date(now - hours * 60 * 60 * 1000).toISOString();
         const rows = [
+          // Phase G: freshness fixtures
           {
             task_id: 'local-seed-g-success-fresh',
+            status: 'Success',
             file_id: 'file-seed-g-fresh',
             download_url: 'local-placeholder://fresh',
-            refreshed_at: isoOffset(2), // 2h ago => fresh
+            fail_reason: null,
+            refreshed_at: isoOffset(2),
             updated_at: isoOffset(2),
           },
           {
             task_id: 'local-seed-g-success-aging',
+            status: 'Success',
             file_id: 'file-seed-g-aging',
             download_url: 'local-placeholder://aging',
-            refreshed_at: isoOffset(15), // 15h ago => aging
+            fail_reason: null,
+            refreshed_at: isoOffset(15),
             updated_at: isoOffset(15),
           },
           {
             task_id: 'local-seed-g-success-stale',
+            status: 'Success',
             file_id: 'file-seed-g-stale',
             download_url: 'local-placeholder://stale',
-            refreshed_at: isoOffset(30), // 30h ago => stale
+            fail_reason: null,
+            refreshed_at: isoOffset(30),
             updated_at: isoOffset(30),
           },
           {
             task_id: 'local-seed-g-success-no-url',
+            status: 'Success',
             file_id: 'file-seed-g-nourl',
             download_url: null,
+            fail_reason: null,
             refreshed_at: null,
             updated_at: isoOffset(1),
           },
           {
             task_id: 'local-seed-g-fail',
+            status: 'Fail',
             file_id: null,
             download_url: null,
+            fail_reason: 'simulated failure',
             refreshed_at: null,
             updated_at: isoOffset(40),
+          },
+          // Phase H: error-category fixtures
+          {
+            task_id: 'local-seed-h-fail-quota',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'MiniMax returned: insufficient token plan balance, please top up',
+            refreshed_at: null,
+            updated_at: isoOffset(1),
+          },
+          {
+            task_id: 'local-seed-h-fail-invalid-params',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'MiniMax returned: unsupported model combination for the chosen resolution',
+            refreshed_at: null,
+            updated_at: isoOffset(2),
+          },
+          {
+            task_id: 'local-seed-h-fail-auth',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'MiniMax returned: 401 unauthorized, invalid api key',
+            refreshed_at: null,
+            updated_at: isoOffset(3),
+          },
+          {
+            task_id: 'local-seed-h-fail-network',
+            status: 'Fail',
+            file_id: null,
+            download_url: null,
+            fail_reason: 'fetch failed: ECONNRESET while contacting MiniMax',
+            refreshed_at: null,
+            updated_at: isoOffset(4),
           },
         ];
 
@@ -168,15 +229,15 @@ function seedFreshnessFixtures() {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               r.task_id,
-              'Phase G seed prompt for freshness check',
+              'Phase G/H seed prompt for regression check',
               'MiniMax-Hailuo-2.3',
               6,
               '768P',
               1,
-              r.task_id === 'local-seed-g-fail' ? 'Fail' : 'Success',
+              r.status,
               r.file_id,
               r.download_url,
-              r.task_id === 'local-seed-g-fail' ? 'simulated failure' : null,
+              r.fail_reason,
               isoOffset(50),
               r.updated_at,
               r.refreshed_at,
@@ -231,7 +292,17 @@ function stopServer() {
 
 function assertNoKeyLeakage(payload, label) {
   const text = JSON.stringify(payload || {});
-  if (text.includes('MINIMAX_API_KEY') || /eyJ[A-Za-z0-9_-]{20,}/.test(text)) {
+  // A literal value or full Bearer token. The string
+  // "MINIMAX_API_KEY" by itself (as a config name) is NOT a
+  // leak; only an actual key value or JWT-style token is.
+  const looksLikeValue = (s) => /^[A-Za-z0-9_-]{20,}$/.test(s);
+  const hasKeyValue = text
+    .split(/[",{}\s]+/)
+    .filter((tok) => tok && tok !== 'MINIMAX_API_KEY')
+    .some((tok) => looksLikeValue(tok) && /eyJ/i.test(tok));
+  const hasJwt = /eyJ[A-Za-z0-9_-]{20,}/.test(text);
+  const hasEnvAssignment = /MINIMAX_API_KEY\s*[:=]\s*['"]?[A-Za-z0-9_-]{16,}['"]?/.test(text);
+  if (hasKeyValue || hasJwt || hasEnvAssignment) {
     recordResult(`${label}: no key leak`, false, 'response body contained a key fragment');
     return false;
   }
@@ -599,6 +670,148 @@ async function runChecks() {
   } catch (err) {
     recordResult('GET /api/tasks stale-url -> stale', false, err.message);
   }
+
+  // 20. Phase H: errorClassifier unit-test (quota example)
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'out of quota' }).error_category;
+    recordResult('errorClassifier: quota example -> quota', got === 'quota', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: quota example', false, err.message);
+  }
+
+  // 21. Phase H: errorClassifier unit-test (rate limit example)
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ status: 429 }).error_category;
+    recordResult('errorClassifier: status=429 -> rate_limit', got === 'rate_limit', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: rate_limit', false, err.message);
+  }
+
+  // 22. Phase H: errorClassifier unit-test (invalid params example)
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'unsupported model' }).error_category;
+    recordResult('errorClassifier: invalid params example -> invalid_params', got === 'invalid_params', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: invalid_params', false, err.message);
+  }
+
+  // 23. Phase H: errorClassifier unit-test (auth example)
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ status: 401 }).error_category;
+    recordResult('errorClassifier: status=401 -> auth', got === 'auth', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: auth', false, err.message);
+  }
+
+  // 24. Phase H: errorClassifier unit-test (server error example)
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ status: 503 }).error_category;
+    recordResult('errorClassifier: status=503 -> server_error', got === 'server_error', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: server_error', false, err.message);
+  }
+
+  // 25. Phase H: errorClassifier unit-test (network example)
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'fetch failed' }).error_category;
+    recordResult('errorClassifier: fetch failed -> network', got === 'network', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: network', false, err.message);
+  }
+
+  // 26. Phase H: errorClassifier unit-test (timeout example)
+  try {
+    const { classifyVideoError } = require(path.resolve(ROOT, 'server', 'services', 'errorClassifier'));
+    const got = classifyVideoError({ fail_reason: 'polling reached max attempts' }).error_category;
+    recordResult('errorClassifier: polling max attempts -> timeout', got === 'timeout', `got=${got}`);
+  } catch (err) {
+    recordResult('errorClassifier: timeout', false, err.message);
+  }
+
+  // 27. Phase H: GET /api/tasks returns error_category on the seeded quota row
+  try {
+    const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=local-seed-h-fail-quota`);
+    const body = await r.json().catch(() => ({}));
+    const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === 'local-seed-h-fail-quota') : null;
+    const ok = r.status === 200
+      && t
+      && t.status === 'Fail'
+      && t.error_category === 'quota'
+      && t.error_severity === 'error'
+      && typeof t.error_user_message === 'string'
+      && typeof t.error_suggested_action === 'string'
+      && t.error_can_retry === false;
+    recordResult(
+      'GET /api/tasks?status=Fail quota row -> error_category=quota',
+      ok,
+      `category=${t?.error_category} severity=${t?.error_severity} can_retry=${t?.error_can_retry}`,
+    );
+  } catch (err) {
+    recordResult('GET /api/tasks quota error_category', false, err.message);
+  }
+
+  // 28. Phase H: GET /api/tasks returns error_category=invalid_params / auth / network
+  try {
+    const cases = [
+      { task_id: 'local-seed-h-fail-invalid-params', expected: 'invalid_params' },
+      { task_id: 'local-seed-h-fail-auth', expected: 'auth' },
+      { task_id: 'local-seed-h-fail-network', expected: 'network' },
+    ];
+    let allOk = true;
+    let details = [];
+    for (const c of cases) {
+      const r = await fetch(`${base}/api/tasks?passcode=${encodeURIComponent(SITE_PASSCODE)}&q=${encodeURIComponent(c.task_id)}`);
+      const body = await r.json().catch(() => ({}));
+      const t = Array.isArray(body.tasks) ? body.tasks.find((x) => x.task_id === c.task_id) : null;
+      const ok = r.status === 200 && t && t.error_category === c.expected;
+      allOk = allOk && ok;
+      details.push(`${c.task_id}->${t?.error_category || 'missing'}`);
+    }
+    recordResult(
+      'GET /api/tasks?status=Fail invalid_params/auth/network rows -> matching categories',
+      allOk,
+      details.join(', '),
+    );
+  } catch (err) {
+    recordResult('GET /api/tasks error_category coverage', false, err.message);
+  }
+
+  // 29. Phase H: smoke dry-run does NOT modify docs/PHASE_A_API_SMOKE_REPORT.md
+  try {
+    const target = path.resolve(ROOT, 'docs', 'PHASE_A_API_SMOKE_REPORT.md');
+    const before = fs.readFileSync(target, 'utf8');
+    const beforeMtime = fs.statSync(target).mtimeMs;
+    const smoke = spawn(process.execPath, [path.resolve(ROOT, 'scripts', 'smoke-text-to-video.js')], {
+      cwd: ROOT,
+      env: { ...process.env, PORT: '0', NODE_ENV: 'test' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let smokeOut = '';
+    smoke.stdout.on('data', (c) => { smokeOut += c.toString(); });
+    smoke.stderr.on('data', (c) => { smokeOut += c.toString(); });
+    await new Promise((resolve) => smoke.on('exit', resolve));
+    const after = fs.readFileSync(target, 'utf8');
+    const afterMtime = fs.statSync(target).mtimeMs;
+    const ok = before === after && beforeMtime === afterMtime;
+    recordResult(
+      'npm run smoke:video (dry-run) leaves docs/PHASE_A_API_SMOKE_REPORT.md untouched',
+      ok,
+      ok ? 'content and mtime identical' : `content_changed=${before !== after} mtime_changed=${beforeMtime !== afterMtime}`,
+    );
+    if (smokeOut.includes('MINIMAX_API_KEY: repl')) {
+      recordResult('dry-run output does not echo real key fragment', false, 'dry-run output contained a real key fragment');
+    } else {
+      recordResult('dry-run output does not echo real key fragment', true, 'no real key fragment in dry-run output');
+    }
+  } catch (err) {
+    recordResult('smoke dry-run hygiene', false, err.message);
+  }
 }
 
 async function main() {
@@ -610,28 +823,28 @@ async function main() {
     // ignore
   }
 
-  logLine(`[phase-g] check:api starting on port ${PORT}`);
+  logLine(`[phase-h] check:api starting on port ${PORT}`);
 
   if (process.env.CONFIRM_REAL_VIDEO === '1') {
-    logLine('[phase-g] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
+    logLine('[phase-h] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
     process.exitCode = 2;
     return;
   }
 
   try {
-    await seedFreshnessFixtures();
-    logLine('[phase-g] local SQLite freshness fixtures seeded (offline, fake ids)');
+    await seedFixtures();
+    logLine('[phase-h] local SQLite fixtures seeded (offline, fake ids)');
   } catch (err) {
-    logLine(`[phase-g] failed to seed freshness fixtures: ${err.message}`);
+    logLine(`[phase-h] failed to seed fixtures: ${err.message}`);
     process.exitCode = 1;
     return;
   }
 
   try {
     await startServer();
-    logLine(`[phase-g] server up on :${PORT}`);
+    logLine(`[phase-h] server up on :${PORT}`);
   } catch (err) {
-    logLine(`[phase-g] failed to start server: ${err.message}`);
+    logLine(`[phase-h] failed to start server: ${err.message}`);
     process.exitCode = 1;
     return;
   }
@@ -644,18 +857,18 @@ async function main() {
 
   const passed = checks.filter((c) => c.ok).length;
   const failed = checks.length - passed;
-  logLine(`[phase-g] summary: ${passed}/${checks.length} checks passed`);
+  logLine(`[phase-h] summary: ${passed}/${checks.length} checks passed`);
   if (failed > 0) {
-    logLine(`[phase-g] FAILED checks:`);
+    logLine(`[phase-h] FAILED checks:`);
     checks.filter((c) => !c.ok).forEach((c) => logLine(`  - ${c.name}: ${c.detail || ''}`));
     process.exitCode = 1;
   } else {
-    logLine(`[phase-g] all checks PASSED. No real MiniMax task was created.`);
+    logLine(`[phase-h] all checks PASSED. No real MiniMax task was created.`);
   }
 }
 
 main().catch((err) => {
-  logLine(`[phase-g] unexpected error: ${err && err.message ? err.message : err}`);
+  logLine(`[phase-h] unexpected error: ${err && err.message ? err.message : err}`);
   stopServer();
   process.exitCode = 1;
 });

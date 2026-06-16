@@ -447,6 +447,72 @@ textarea {
   border-color: var(--line);
 }
 
+.error-category-block {
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.6);
+}
+
+.error-category-block p {
+  margin: 4px 0;
+}
+
+.error-pill,
+.severity-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.4;
+  margin-left: 4px;
+}
+
+.error-pill.error-quota {
+  color: #fca5a5;
+  border-color: rgba(252, 165, 165, 0.4);
+}
+
+.error-pill.error-auth {
+  color: #fca5a5;
+  border-color: rgba(252, 165, 165, 0.4);
+}
+
+.error-pill.error-rate_limit,
+.error-pill.error-server_error,
+.error-pill.error-network,
+.error-pill.error-timeout {
+  color: #fcd34d;
+  border-color: rgba(252, 211, 77, 0.4);
+}
+
+.error-pill.error-invalid_params {
+  color: #93c5fd;
+  border-color: rgba(147, 197, 253, 0.4);
+}
+
+.error-pill.error-unknown {
+  color: var(--muted);
+  border-color: var(--line);
+}
+
+.severity-tag.severity-info {
+  color: #93c5fd;
+  border-color: rgba(147, 197, 253, 0.4);
+}
+
+.severity-tag.severity-warning {
+  color: #fcd34d;
+  border-color: rgba(252, 211, 77, 0.4);
+}
+
+.severity-tag.severity-error {
+  color: #fca5a5;
+  border-color: rgba(252, 165, 165, 0.4);
+}
+
 .badge {
   border: 1px solid var(--line);
   padding: 4px 10px;

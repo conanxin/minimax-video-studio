@@ -23,6 +23,7 @@ const {
 } = require('./services/minimaxClient');
 const pollingConfig = require('../shared/pollingConfig.json');
 const freshness = require('./services/downloadLinkFreshness');
+const errorClassifier = require('./services/errorClassifier');
 const { toIsoNow } = require('./db');
 
 config();
@@ -103,6 +104,7 @@ function normalizeTaskPayload(req) {
 function toSafeTaskPayload(task) {
   if (!task) return null;
   const summary = freshness.classify(task);
+  const errorInfo = errorClassifier.classifyFromTask(task);
   return {
     id: task.id,
     task_id: task.task_id,
@@ -122,6 +124,12 @@ function toSafeTaskPayload(task) {
     download_url_status: summary.download_url_status,
     download_url_age_hours: summary.download_url_age_hours,
     should_refresh_download_url: summary.should_refresh_download_url,
+    error_category: errorInfo.error_category,
+    error_severity: errorInfo.severity,
+    error_user_message: errorInfo.user_message,
+    error_suggested_action: errorInfo.suggested_action,
+    error_can_retry: errorInfo.can_retry,
+    error_retry_hint: errorInfo.retry_hint,
   };
 }
 

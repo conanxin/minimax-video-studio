@@ -16,6 +16,8 @@ Current status:
   grouping, and copy-params affordances are merged.
 - Phase G download link freshness indicators and link-freshness UX
   are merged.
+- Phase H error categorization and smoke dry-run hygiene are
+  merged.
 - Default smoke checks are non-consuming (dry run).
 
 ## Features
@@ -34,6 +36,16 @@ Current status:
 - Per-task video error fallback: if the `<video>` element fails to
   load, the detail panel surfaces a hint pointing to
   `Re-fetch download link` instead of silently failing
+- Per-task error categorization: every task response carries
+  `error_category` / `error_severity` /
+  `error_user_message` / `error_suggested_action` /
+  `error_can_retry` / `error_retry_hint`, derived from
+  `fail_reason`, `base_resp.status_code`, and HTTP status by
+  `server/services/errorClassifier.js`
+- Smoke `dry-run` writes only to console + gitignored
+  `reports/local/smoke-dry-run.local.{md,json}`; the public
+  `docs/PHASE_A_API_SMOKE_REPORT.md` is no longer touched by the
+  smoke script
 - Task history listing with status filter, keyword search, and
   paginated backend (`GET /api/tasks?limit=&offset=&status=&q=`)
 - Time-grouped task history (Today / Yesterday / Earlier)
@@ -70,6 +82,13 @@ Phase G follows the same scope discipline. It only adds a soft
 download-link freshness hint layer on top of the existing refresh
 endpoint. It does **not** auto-refresh, does **not** introduce new
 generation modes, Docker, CI, or dependency changes.
+
+Phase H follows the same scope discipline. It only adds a pure
+error-categorization layer on top of the existing `fail_reason`
+field, plus a smoke-hygiene fix so the public
+`docs/PHASE_A_API_SMOKE_REPORT.md` is no longer mutated by every
+dry-run. It does **not** introduce new generation modes, Docker,
+CI, or dependency changes.
 
 ## Project structure
 
@@ -191,17 +210,41 @@ npm run smoke:video
     `fresh` with `should_refresh_download_url: false`
   - `Success + file_id + 15h-old download_url` is reported as
     `aging` with `should_refresh_download_url: true`
-  - `Success + file_id + 30h-old download_url` is reported as
-    `stale` with `should_refresh_download_url: true`
+  - `GET /api/tasks?status=Success + 30h-old download_url` is
+    reported as `stale` with `should_refresh_download_url: true`
+  - `errorClassifier({ fail_reason: 'out of quota' })` returns
+    `error_category: 'quota'`
+  - `errorClassifier({ status: 429 })` returns
+    `error_category: 'rate_limit'`
+  - `errorClassifier({ fail_reason: 'unsupported model' })`
+    returns `error_category: 'invalid_params'`
+  - `errorClassifier({ status: 401 })` returns
+    `error_category: 'auth'`
+  - `errorClassifier({ status: 503 })` returns
+    `error_category: 'server_error'`
+  - `errorClassifier({ fail_reason: 'fetch failed' })` returns
+    `error_category: 'network'`
+  - `errorClassifier({ fail_reason: 'polling reached max
+    attempts' })` returns `error_category: 'timeout'`
+  - `GET /api/tasks` returns `error_category: 'quota'` for the
+    seeded quota-fail row
+  - `GET /api/tasks` returns the matching
+    `invalid_params` / `auth` / `network` categories for the
+    three other seeded fail rows
+  - `npm run smoke:video` (dry-run) leaves
+    `docs/PHASE_A_API_SMOKE_REPORT.md` content + mtime
+    unchanged, and its console output never echoes a real key
+    fragment
 - The script aborts immediately if `CONFIRM_REAL_VIDEO=1` is set.
 - The script never reads, logs, or prints `MINIMAX_API_KEY`.
 - The script never prints a real `download_url`; it only asserts
   presence/absence.
-- The Phase G run writes local SQLite seed rows (`local-seed-g-*`
-  prefix) before booting the server. These rows are obviously fake
-  and live in the same gitignored `data/*.sqlite` file.
+- The Phase G / Phase H run writes local SQLite seed rows
+  (`local-seed-g-*` / `local-seed-h-*` prefix) before booting
+  the server. These rows are obviously fake and live in the
+  same gitignored `data/*.sqlite` file.
 - The run output is appended to
-  `reports/phase-g-api-regression.report.txt` (gitignored).
+  `reports/phase-h-api-regression.report.txt` (gitignored).
 
 ```bash
 npm run check:api
@@ -324,6 +367,85 @@ The frontend renders:
 The `q` value used by the new check:api freshness regression
 tests is bound through `?` parameters in `sqlite3`, so the same
 SQL-injection-safety guarantee from Phase F applies.
+
+## Error categorization
+
+Phase H adds a pure error-classification layer that turns each
+`Fail` task's `fail_reason`, `base_resp.status_code`, and HTTP
+status into a stable category plus a user-friendly message and a
+suggested next action. The classifier lives in
+`server/services/errorClassifier.js` and is exposed via
+`classifyVideoError(input)` / `classifyFromTask(task)`.
+
+Eight categories are returned:
+
+| `error_category` | Trigger (example) | `can_retry` | `severity` |
+|-------------------|-------------------|-------------|------------|
+| `quota` | `out of quota`, `insufficient balance`, `token plan`, 额度 / 余额 | `false` (must top up) | `error` |
+| `rate_limit` | `rate limit`, `too many requests`, HTTP 429, 限流 | `true` | `warning` |
+| `invalid_params` | `invalid`, `unsupported model`, `prompt too long`, 参数 / 不支持 | `true` | `warning` |
+| `auth` | HTTP 401/403, `unauthorized`, `forbidden`, `invalid api key` | `false` (must fix key) | `error` |
+| `server_error` | HTTP 5xx, `internal error`, `service unavailable` | `true` | `warning` |
+| `network` | `ECONNRESET`, `ETIMEDOUT`, `fetch failed`, 网络 | `true` | `warning` |
+| `timeout` | `polling reached max attempts`, `timed out`, 超时 | `true` (no auto-regenerate) | `info` |
+| `unknown` | anything else | `false` | `warning` |
+
+Every task response now carries these fields in addition to
+`fail_reason`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `error_category` | `string` | one of the eight categories above |
+| `error_severity` | `string` | `info` / `warning` / `error` |
+| `error_user_message` | `string` | stable Chinese template explaining the failure |
+| `error_suggested_action` | `string` | what the user should do next |
+| `error_can_retry` | `bool` | whether a manual retry is reasonable |
+| `error_retry_hint` | `string` | extra hint about quota / auto-submit caveats |
+
+The frontend renders the category in a dedicated "错误类型"
+block in the task detail panel, with the user message, the
+suggested action, and a `适合 / 不建议` retry label. For
+`invalid_params` the block specifically nudges the user toward
+the "用此参数填回表单" button. For `quota` / `auth` it
+emphasizes fixing the upstream root cause before any new
+submission. For `rate_limit` / `server_error` / `network` /
+`timeout` it explicitly says the system will **not**
+auto-regenerate the task.
+
+The classifier is a pure function with no I/O and no new
+dependencies. It is exercised by seven unit-style checks in
+`npm run check:api` plus four seed-driven `GET /api/tasks`
+checks for the `quota` / `invalid_params` / `auth` / `network`
+rows.
+
+## Smoke hygiene
+
+Phase H also fixes a Phase A / F / G hygiene gap:
+
+- `npm run smoke:video` in default (non-`CONFIRM_REAL_VIDEO=1`)
+  mode used to overwrite `docs/PHASE_A_API_SMOKE_REPORT.md` on
+  every run, which meant the public report drifted even though
+  the smoke had nothing real to report.
+- Phase H splits the smoke report into two layers:
+  - `reports/local/smoke-dry-run.local.md` and
+    `reports/local/smoke-dry-run.local.json` — machine-local
+    breadcrumbs that are gitignored under `reports/local/` and
+    are regenerated on every dry-run. The console also prints
+    a 5-line summary so a developer can see the result without
+    opening any file.
+  - `docs/PHASE_A_API_SMOKE_REPORT.md` is **not** touched by
+    `smoke:video` in any mode. It is a historical artifact and
+    is updated only by a dedicated phase.
+- Real smoke (`CONFIRM_REAL_VIDEO=1`) still writes the local
+  `phase-c1-real-smoke.local.{md,json}` pair. The public
+  `docs/PHASE_C1_REAL_SMOKE_REPORT.md` is only updated when
+  `PHASE_C1=1` is also set.
+- `npm run check:api` now has a regression check (#29) that
+  records the content + mtime of
+  `docs/PHASE_A_API_SMOKE_REPORT.md`, runs
+  `npm run smoke:video` (dry-run), and asserts both are
+  unchanged. It also asserts the dry-run output never echoes a
+  real key fragment.
 
 ## Polling guardrails
 

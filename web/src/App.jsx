@@ -864,6 +864,52 @@ export default function App() {
               <p className="error">Fail reason: {selectedTask.fail_reason}</p>
             )}
 
+            {terminalStatus === 'Fail' && (
+              <div className="error-category-block">
+                <p>
+                  <strong>错误类型:</strong>{' '}
+                  <span className={`error-pill error-${selectedTask.error_category || 'unknown'}`}>
+                    {selectedTask.error_category || 'unknown'}
+                  </span>
+                  <span className={`severity-tag severity-${selectedTask.error_severity || 'warning'}`}>
+                    {selectedTask.error_severity || 'warning'}
+                  </span>
+                </p>
+                {selectedTask.error_user_message && (
+                  <p className="hint">{selectedTask.error_user_message}</p>
+                )}
+                {selectedTask.error_suggested_action && (
+                  <p className="hint">
+                    <strong>建议:</strong> {selectedTask.error_suggested_action}
+                  </p>
+                )}
+                {typeof selectedTask.error_can_retry === 'boolean' && (
+                  <p className="hint">
+                    <strong>是否适合重试:</strong>{' '}
+                    {selectedTask.error_can_retry ? '适合' : '不建议（需先处理根因）'}
+                  </p>
+                )}
+                {selectedTask.error_retry_hint && (
+                  <p className="hint">{selectedTask.error_retry_hint}</p>
+                )}
+                {selectedTask.error_category === 'invalid_params' && (
+                  <p className="warning">
+                    请点击下方"用此参数填回表单"按钮，把参数复制回创建表单并修改模型 / 时长 / 分辨率或缩短 Prompt。
+                  </p>
+                )}
+                {['rate_limit', 'server_error', 'network', 'timeout'].includes(selectedTask.error_category) && (
+                  <p className="warning">
+                    本系统不会自动重新生成。请稍后从任务历史刷新状态；如确认需要新视频，再手动点击 Submit（会消耗额度）。
+                  </p>
+                )}
+                {['quota', 'auth'].includes(selectedTask.error_category) && (
+                  <p className="warning">
+                    请先检查 MiniMax 额度或 API Key，确认无误后再考虑重新提交（会消耗额度）。
+                  </p>
+                )}
+              </div>
+            )}
+
             {terminalStatus === 'Success' && hasFileId && (
               <div className="freshness-block">
                 <p>
