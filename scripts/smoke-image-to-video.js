@@ -29,7 +29,9 @@ const I2V_REAL_LOCAL_JSON = path.resolve(I2V_REAL_LOCAL_DIR, 'phase-j-i2v-smoke.
 // only created when both CONFIRM_REAL_VIDEO=1 and CONFIRM_REAL_I2V=1
 // are set AND the script proceeds to submit. The dry-run branch never
 // touches this lock.
-const I2V_REAL_LOCK_PATH = path.resolve(I2V_REAL_LOCAL_DIR, 'i2v-real-smoke.lock');
+const I2V_REAL_LOCK_PATH = process.env.I2V_SMOKE_LOCK_PATH
+  ? path.resolve(process.env.I2V_SMOKE_LOCK_PATH)
+  : path.resolve(I2V_REAL_LOCAL_DIR, 'i2v-real-smoke.lock');
 // Phase J.3: I2V smoke now sources the first_frame_image from a
 // deterministic PNG fixture instead of a hand-written PNG encoder.
 // The fixture is produced by scripts/generate-i2v-fixture.js and

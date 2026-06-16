@@ -78,13 +78,114 @@ function assertNoKeyLeakage(payload, label) {
 }
 
 function assertNoDownloadUrlLeak(payload, label) {
-  const text = JSON.stringify(payload || {});
-  if (/https?:\/\/[^\s"']{16,}/.test(text)) {
-    recordResult(`${label}: no download_url leak`, false, 'response body contained a URL fragment');
+  // Phase L: structurally distinguish a legitimate `download_url` field
+  // value from a real leak. The previous regex flagged any 16+ char
+  // http(s):// fragment anywhere in the body, which is wrong now that
+  // the local SQLite store legitimately carries real download_url
+  // values (id=325 from Phase J.4). We accept the legitimate field
+  // value but flag URLs that leak through log lines, error messages,
+  // unexpected payload fields, or non-redacted console output.
+  const OFFICIAL_API_BASE_RE = /https?:\/\/(api|www)\.minimaxi\.com\//;
+  const LEGIT_FIELD_RE = /"download_url"\s*:\s*"[^"]*"/g;
+  const TEST_FIXTURE_URL_RE = /https?:\/\/[^"\s']*(example\.invalid|local-seed-)[^"\s']*/g;
+  const PRESENT_ABSENT_RE = /"(?:download_url|file_id|task_id)"\s*:\s*"(?:present|absent|redacted|null|unknown)"/g;
+
+  // Walk the payload (object or array) and check every string field
+  // for URL fragments that are NOT in a legitimate position.
+  const visited = new WeakSet();
+  function walk(value, key) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string') {
+      // Skip the official API base; it is referenced everywhere in
+      // fixtures and in the smoke console output.
+      if (OFFICIAL_API_BASE_RE.test(value)) return null;
+      // Skip test fixture obvious-fake hosts.
+      if (TEST_FIXTURE_URL_RE.test(value)) return null;
+      // Match a URL fragment 16+ chars long that is NOT the
+      // legitimate `download_url` field value.
+      const urlMatch = /https?:\/\/[^\s"',}\\]{16,}/.exec(value);
+      if (!urlMatch) return null;
+      // If this string IS a download_url value, it is legitimate.
+      if (key === 'download_url') return null;
+      return { url: urlMatch[0], key, value };
+    }
+    if (typeof value !== 'object') return null;
+    if (visited.has(value)) return null;
+    visited.add(value);
+    for (const k of Object.keys(value)) {
+      const r = walk(value[k], k);
+      if (r) return r;
+    }
+    return null;
+  }
+  const leak = walk(payload, null);
+  if (leak) {
+    recordResult(
+      `${label}: no download_url leak`,
+      false,
+      `response body contained a URL fragment in field "${leak.key}"`,
+    );
     return false;
   }
-  recordResult(`${label}: no download_url leak`, true, 'no URL fragment detected');
+  recordResult(
+    `${label}: no download_url leak`,
+    true,
+    'no URL fragment outside legitimate download_url / api-base / test-fixture',
+  );
   return true;
+}
+
+// Phase L: helpers to snapshot and restore the real once-only lock
+// so that check:api's lock-test sub-test never destroys the real
+// safety artifact. The real lock lives at
+// `reports/local/i2v-real-smoke.lock`; test-only locks live at
+// `reports/local/i2v-real-smoke.test.lock`.
+function snapshotLockState(lockPath) {
+  try {
+    const st = fs.statSync(lockPath);
+    const content = fs.readFileSync(lockPath, 'utf8');
+    const mode = st.mode & 0o777;
+    return { exists: true, content, mode, mtimeMs: st.mtimeMs, size: st.size };
+  } catch (_) {
+    return { exists: false };
+  }
+}
+
+function restoreLockState(lockPath, snapshot) {
+  // If there was a lock, write the exact bytes back with the exact
+  // mode and try to preserve the mtime. If there wasn't, ensure the
+  // file is gone.
+  if (snapshot.exists) {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, snapshot.content, 'utf8');
+    try { fs.chmodSync(lockPath, snapshot.mode); } catch (_) { /* best effort */ }
+    try {
+      fs.utimesSync(lockPath, snapshot.mtimeMs / 1000, snapshot.mtimeMs / 1000);
+    } catch (_) { /* best effort */ }
+  } else {
+    try { fs.unlinkSync(lockPath); } catch (_) { /* ignore */ }
+  }
+}
+
+function assertLockUnchanged(before, after, label) {
+  if (!!before.exists !== !!after.exists) {
+    return { ok: false, detail: `existence changed (before=${before.exists} after=${after.exists})` };
+  }
+  if (!before.exists && !after.exists) {
+    return { ok: true, detail: 'absent -> absent' };
+  }
+  if (before.content !== after.content) {
+    return { ok: false, detail: 'content changed' };
+  }
+  if (before.mode !== after.mode) {
+    return { ok: false, detail: `mode changed (before=${before.mode.toString(8)} after=${after.mode.toString(8)})` };
+  }
+  // We allow mtime to change (e.g. read access can update atime on
+  // some systems), but we do NOT allow size to change.
+  if (before.size !== after.size) {
+    return { ok: false, detail: `size changed (before=${before.size} after=${after.size})` };
+  }
+  return { ok: true, detail: 'content + mode + size unchanged' };
 }
 
 // Phase G + Phase H: write deterministic local SQLite seed rows
@@ -1337,27 +1438,38 @@ async function runChecks() {
     recordResult('fixture:i2v:validate', false, err.message);
   }
 
-  // 47. Phase J.3: smoke:i2v dry-run leaves no lock behind, data_url
-  //     present but no full Data URL echoed in stdout.
+  // 47. Phase L: smoke:i2v dry-run must NOT change the real
+  //     once-only lock. We snapshot the real lock, run the dry-run,
+  //     and assert the snapshot is byte-for-byte preserved.
+  //     We also assert data_url_present=yes and no full Data URL
+  //     echo, like Phase J.3.
   try {
-    const lockPath = path.resolve(ROOT, 'reports', 'local', 'i2v-real-smoke.lock');
-    let lockBefore = false;
-    try { lockBefore = fs.existsSync(lockPath); } catch (_) { /* ignore */ }
+    const realLockPath = path.resolve(ROOT, 'reports', 'local', 'i2v-real-smoke.lock');
+    const lockBefore = snapshotLockState(realLockPath);
     const smoke = spawn(process.execPath, [path.resolve(ROOT, 'scripts', 'smoke-image-to-video.js')], {
       cwd: ROOT,
-      env: { ...process.env, PORT: '0', NODE_ENV: 'test' },
+      // CRITICAL: explicitly clear CONFIRM_REAL_* so a parent shell
+      // with stale env vars does not push us into the REAL branch.
+      env: {
+        ...process.env,
+        CONFIRM_REAL_VIDEO: '',
+        CONFIRM_REAL_I2V: '',
+        I2V_SMOKE_TEST_LOCK_ONLY: '',
+        PORT: '0',
+        NODE_ENV: 'test',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let smokeOut = '';
     smoke.stdout.on('data', (c) => { smokeOut += c.toString(); });
     smoke.stderr.on('data', (c) => { smokeOut += c.toString(); });
     await new Promise((resolve) => smoke.on('exit', resolve));
-    let lockAfter = false;
-    try { lockAfter = fs.existsSync(lockPath); } catch (_) { /* ignore */ }
+    const lockAfter = snapshotLockState(realLockPath);
+    const unchanged = assertLockUnchanged(lockBefore, lockAfter, 'real lock');
     recordResult(
-      'smoke:i2v dry-run does not create the real-smoke lock',
-      !lockAfter && !lockBefore,
-      `before=${lockBefore} after=${lockAfter}`,
+      'smoke:i2v dry-run does not modify the real once-only lock',
+      unchanged.ok,
+      `${unchanged.detail} (before.exists=${lockBefore.exists} after.exists=${lockAfter.exists})`,
     );
     // Detect a stray "data:image/png;base64,<long-string>" pattern in
     // the dry-run output. The smoke script intentionally logs only the
@@ -1379,20 +1491,26 @@ async function runChecks() {
     recordResult('smoke:i2v dry-run Phase J.3 hygiene', false, err.message);
   }
 
-  // 48. Phase J.3: smoke:i2v real mode with I2V_SMOKE_TEST_LOCK_ONLY=1
-  //     and a synthetic lock present MUST refuse via the lock gate and
-  //     must NOT touch MiniMax. This exercises the Phase J.2 once-only
-  //     lock through the real-mode code path without making any remote
-  //     call.
+  // 48. Phase L: smoke:i2v real-mode lock-gate test. We use a
+  //     DEDICATED test-only lock path
+  //     (`reports/local/i2v-real-smoke.test.lock`) so the real
+  //     once-only safety artifact is never touched. We pin
+  //     `I2V_SMOKE_LOCK_PATH` so the smoke script reads/writes the
+  //     test lock instead. `I2V_SMOKE_TEST_LOCK_ONLY=1` keeps the
+  //     script in the lock-blocked code path; it MUST NEVER reach
+  //     the remote call.
   try {
-    const lockPath = path.resolve(ROOT, 'reports', 'local', 'i2v-real-smoke.lock');
+    const realLockPath = path.resolve(ROOT, 'reports', 'local', 'i2v-real-smoke.lock');
+    const testLockPath = path.resolve(ROOT, 'reports', 'local', 'i2v-real-smoke.test.lock');
     const mdPath = path.resolve(ROOT, 'reports', 'local', 'i2v-smoke-blocked-by-lock.local.md');
-    // Make sure there is no leftover lock from a previous run.
-    try { fs.unlinkSync(lockPath); } catch (_) { /* ignore */ }
-    // Plant a synthetic lock.
-    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    // Snapshot the REAL lock state. The test must leave it untouched.
+    const realLockBefore = snapshotLockState(realLockPath);
+    // Clean up any leftover test lock from a previous run.
+    try { fs.unlinkSync(testLockPath); } catch (_) { /* ignore */ }
+    // Plant a synthetic test lock at the DEDICATED test path.
+    fs.mkdirSync(path.dirname(testLockPath), { recursive: true });
     fs.writeFileSync(
-      lockPath,
+      testLockPath,
       JSON.stringify({
         created_at: '2026-06-16T12:00:00.000Z',
         finished_at: '2026-06-16T12:00:01.000Z',
@@ -1412,6 +1530,10 @@ async function runChecks() {
         CONFIRM_REAL_VIDEO: '1',
         CONFIRM_REAL_I2V: '1',
         I2V_SMOKE_TEST_LOCK_ONLY: '1',
+        // CRITICAL: pin the lock path to the test path so the
+        // smoke script's lock read/write does NOT touch the real
+        // safety artifact.
+        I2V_SMOKE_LOCK_PATH: testLockPath,
         PORT: '0',
         NODE_ENV: 'test',
       },
@@ -1440,15 +1562,25 @@ async function runChecks() {
       mdAfter !== null && mdAfter !== mdBefore,
       mdAfter === null ? 'report missing' : 'report refreshed',
     );
-    // Cleanup: leave the lock in place if it was already there
-    // before our test; otherwise remove it so subsequent runs are
-    // not blocked. (The lock is gitignored so this never reaches git.)
+    // CRITICAL: assert the REAL lock is byte-for-byte unchanged.
+    const realLockAfter = snapshotLockState(realLockPath);
+    const realUnchanged = assertLockUnchanged(realLockBefore, realLockAfter, 'real lock');
+    recordResult(
+      'smoke:i2v real+lock+test-mode did not touch the real once-only lock',
+      realUnchanged.ok,
+      `${realUnchanged.detail} (before.exists=${realLockBefore.exists} after.exists=${realLockAfter.exists})`,
+    );
+    // Clean up the test lock (it is a test fixture, not a real artifact).
     try {
-      const raw = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      const raw = JSON.parse(fs.readFileSync(testLockPath, 'utf8'));
       if (raw && raw.synthetic_for_check_api) {
-        fs.unlinkSync(lockPath);
+        fs.unlinkSync(testLockPath);
       }
     } catch (_) { /* ignore */ }
+    // Defensive: if the real lock is gone, restore from snapshot.
+    if (realLockBefore.exists && !realLockAfter.exists) {
+      restoreLockState(realLockPath, realLockBefore);
+    }
   } catch (err) {
     recordResult('smoke:i2v real+lock+test-mode', false, err.message);
   }

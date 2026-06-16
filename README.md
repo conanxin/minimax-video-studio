@@ -23,6 +23,12 @@ Current status:
 - Once-only local lock (`reports/local/i2v-real-smoke.lock`) remains
   armed. A second real I2V submit is refused unless the operator
   explicitly authorizes a new phase and removes the lock by hand.
+  The lock is a **sticky safety artifact**: `npm run check:api`
+  uses a dedicated test-only lock path
+  (`reports/local/i2v-real-smoke.test.lock`) so it never touches
+  the real lock. The dry-run sub-test snapshots the real lock
+  before and after the smoke run and asserts byte-for-byte
+  preservation (content + mode + size).
 - Default smoke checks are non-consuming (dry run). `check:minimax-auth`
   performs a Token Plan usage lookup only — it does NOT call
   `/v1/video_generation` and consumes no video quota.
