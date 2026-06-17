@@ -208,6 +208,43 @@ The Cloudflare Tunnel / Access policy is unchanged; the public
 URL still returns HTTP 302 to the Access login flow for
 unauthenticated requests.
 
+### Remote check-api pass: operator workflow note
+
+`npm run check:api` on the CVM has a known interaction with the
+Phase Q switch that is worth recording here so future operators do
+not get bitten by it:
+
+- `check-api-regression.js` spawns a sibling server on the same
+  port (`PORT=8789`) that the production systemd service already
+  holds. Without coordination, the child process fails with
+  `EADDRINUSE` while `curl` still gets responses from the
+  production server (which is the *previous* release until
+  systemd is restarted). The first attempt on the CVM landed on
+  a `74/75` line because the production server was still on
+  `917c7ad` and did not yet expose `/api/runtime-config`.
+- The Phase Q-aware procedure is:
+  1. `systemctl --user stop minimax-video-studio.service`
+  2. `sed -i '/^REQUIRE_SITE_PASSCODE=/d;/^CLOUDFLARE_ACCESS_EXPECTED=/d' .env`
+     so the sibling server inherits a default passcode-on env
+     (otherwise the new Phase Q default would break the legacy
+     `GET /api/tasks without passcode -> 401` assertion).
+  3. `npm run check:api` — expect `75/75 PASS`.
+  4. Restore the deleted lines, then
+     `systemctl --user start minimax-video-studio.service`.
+
+That run on the CVM completed with `75/75 checks passed` and the
+production service restarted cleanly into the Phase Q
+`REQUIRE_SITE_PASSCODE=false` mode.
+
+This workflow gap is not a Phase Q bug — it is a pre-existing
+property of `check-api-regression.js` that only becomes visible
+once the production deployment sets a non-default
+`REQUIRE_SITE_PASSCODE`. A future phase can address it (e.g.
+make the child server pick `PORT=0` so the OS allocates a free
+port, or pass `REQUIRE_SITE_PASSCODE=true` explicitly into the
+child env); that refactor is out of scope for Phase Q.
+
+
 ## 10. Sensitive information disclosure check
 
 | Class | Captured in this report? |
