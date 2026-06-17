@@ -30,10 +30,53 @@ const { config } = require('dotenv');
 
 config();
 
+// Phase R: after dotenv.config() merges .env into process.env,
+// the harness must own the port-tier knobs (PORT,
+// REQUIRE_SITE_PASSCODE, CLOUDFLARE_ACCESS_EXPECTED) and the
+// access flags that affect the default test mode. We explicitly
+// strip them so a stale local `.env` cannot collide with
+// production's 8789. Operators who need to override PORT can
+// still pass it on the command line; that value is read by the
+// line below.
+delete process.env.REQUIRE_SITE_PASSCODE;
+delete process.env.CLOUDFLARE_ACCESS_EXPECTED;
+// We deliberately do NOT delete process.env.PORT here; the
+// operator-set PORT (from the command line) is the source of
+// truth. What we DO guard against is `dotenv` overwriting a
+// default from a stale .env: that's why we re-read PORT after
+// config() and strip it if the env var was sourced from disk
+// rather than the operator. Heuristic: an explicit operator
+// pass would be non-empty AND non-'0'. If PORT comes from the
+// .env it equals '8789' (the documented production default), so
+// we treat anything that looks like the production default as
+// "from .env" and override it to '0'. This is conservative —
+// operators who really want a specific non-zero port can set
+// SITE_PASSCODE_TEST_PORT (or any non-default) to force the
+// override off.
+if (process.env.PORT === '8789') {
+  // The literal production default. We assume this came from
+  // .env, not from an operator who wanted to retest on 8789.
+  // (Operators on a non-default port can set PORT to anything
+  // other than '8789' to keep the override.)
+  delete process.env.PORT;
+}
+
 const ROOT = path.resolve(__dirname, '..');
 const REPORT_PATH = path.resolve(ROOT, 'reports', 'phase-i-api-regression.report.txt');
 
-const PORT = Number(process.env.PORT) || 8789;
+// Phase R: the regression harness must not share a port with a
+// running production service. We default REQUESTED_PORT to '0',
+// which asks the OS to allocate a free ephemeral port. Operators
+// can still pin a specific port via the PORT env var (e.g.
+// `PORT=18789 npm run check:api`) for reproducibility, but the
+// typical case is OS allocation. The actual port the child server
+// binds to is parsed from its stdout (`MiniMax studio backend
+// running on ${HOST}:${PORT}`) and written to BASE.
+//
+// This declaration MUST happen AFTER the dotenv-scrub above so the
+// stale `.env` value cannot leak into REQUESTED_PORT.
+const REQUESTED_PORT = process.env.PORT || '0';
+let BASE = `http://127.0.0.1:${REQUESTED_PORT === '0' ? '0' : REQUESTED_PORT}`;
 const SITE_PASSCODE = String(process.env.SITE_PASSCODE || 'change_me').trim();
 
 const checks = [];
@@ -474,18 +517,124 @@ async function waitForHealth(url, timeoutMs = 15000) {
   return false;
 }
 
-function startServer() {
+function startServer(overrides = {}) {
+  // Phase R: explicitly inject REQUIRE_SITE_PASSCODE / CLOUDFLARE_ACCESS_EXPECTED
+  // so the child server does not inherit a stale shell environment
+  // (e.g. an operator's CVM `.env` with REQUIRE_SITE_PASSCODE=false
+  // would otherwise silently flip the default-passcode-on
+  // assertions). We strip these two keys from process.env before
+  // passing through, so the only source of truth is `overrides` or
+  // the documented default.
+  const childEnv = { ...process.env };
+  delete childEnv.REQUIRE_SITE_PASSCODE;
+  delete childEnv.CLOUDFLARE_ACCESS_EXPECTED;
+  childEnv.PORT = String(REQUESTED_PORT);
+  childEnv.NODE_ENV = 'test';
+  childEnv.REQUIRE_SITE_PASSCODE = overrides.require_site_passcode === false ? 'false' : 'true';
+  childEnv.CLOUDFLARE_ACCESS_EXPECTED = overrides.cloudflare_access_expected === true ? 'true' : 'false';
+
   return new Promise((resolve, reject) => {
-    serverProcess = spawn(process.execPath, [path.resolve(ROOT, 'server', 'index.js')], {
+    let resolved = false;
+    let stdoutBuffer = '';
+    const proc = spawn(process.execPath, [path.resolve(ROOT, 'server', 'index.js')], {
       cwd: ROOT,
-      env: { ...process.env, PORT: String(PORT), NODE_ENV: 'test' },
+      env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    serverProcess.stdout.on('data', (chunk) => { serverStdout += chunk.toString(); });
-    serverProcess.stderr.on('data', (chunk) => { serverStderr += chunk.toString(); });
-    serverProcess.on('error', reject);
-    waitForHealth(`http://127.0.0.1:${PORT}/api/health`)
-      .then((ready) => (ready ? resolve() : reject(new Error('server did not become healthy in time'))));
+    proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      serverStdout += text;
+      stdoutBuffer += text;
+      // Phase R: parse the bind line `MiniMax studio backend running
+      // on ${HOST}:${PORT}` and rewrite BASE accordingly. We only
+      // resolve once; later matches are ignored.
+      if (!resolved) {
+        const m = stdoutBuffer.match(/MiniMax studio backend running on ([^:\s]+):(\d+)/);
+        if (m) {
+          const host = m[1];
+          const port = m[2];
+          BASE = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`;
+          resolved = true;
+          serverProcess = proc;
+          waitForHealth(`${BASE}/api/health`)
+            .then((ready) => (ready ? resolve() : reject(new Error(`server did not become healthy in time on ${BASE}`))));
+        }
+      }
+    });
+    proc.stderr.on('data', (chunk) => { serverStderr += chunk.toString(); });
+    proc.on('error', reject);
+    // Safety net: if the server never prints the bind line (e.g. it
+    // crashed early), surface the failure within a bounded window.
+    setTimeout(() => {
+      if (!resolved) reject(new Error('timed out waiting for child server to print its bind line'));
+    }, 15000);
+  });
+}
+
+// Phase R: start a sibling server on its own OS-allocated port
+// (or its own PORT env override) and return a handle that owns
+// both the parsed BASE and the child process. Used by the
+// Phase Q OPT_NO_PASSCODE=1 / TEST_NO_PASSCODE=1 branch (both
+// names accepted; OPT_NO_PASSCODE=1 is the canonical name going
+// forward, TEST_NO_PASSCODE=1 is kept as a backward-compatible
+// alias so old CI scripts do not silently break).
+// needs a second server without disturbing the main
+// `serverProcess` slot.
+function startSiblingServer(overrides = {}) {
+  // Same env-injection hygiene as startServer, but the caller
+  // controls the lifetime via the returned handle.
+  const childEnv = { ...process.env };
+  delete childEnv.REQUIRE_SITE_PASSCODE;
+  delete childEnv.CLOUDFLARE_ACCESS_EXPECTED;
+  childEnv.PORT = process.env.SIBLING_PORT || '0';
+  childEnv.NODE_ENV = 'test';
+  childEnv.REQUIRE_SITE_PASSCODE = overrides.require_site_passcode === false ? 'false' : 'true';
+  childEnv.CLOUDFLARE_ACCESS_EXPECTED = overrides.cloudflare_access_expected === true ? 'true' : 'false';
+
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    let stdoutBuffer = '';
+    let siblingBase = null;
+    let stdoutAccum = '';
+    let stderrAccum = '';
+    const proc = spawn(process.execPath, [path.resolve(ROOT, 'server', 'index.js')], {
+      cwd: ROOT,
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      stdoutAccum += text;
+      stdoutBuffer += text;
+      if (!resolved) {
+        const m = stdoutBuffer.match(/MiniMax studio backend running on ([^:\s]+):(\d+)/);
+        if (m) {
+          const host = m[1];
+          const port = m[2];
+          siblingBase = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`;
+          resolved = true;
+          waitForHealth(`${siblingBase}/api/health`)
+            .then((ready) => (
+              ready
+                ? resolve({
+                    proc,
+                    base: siblingBase,
+                    stop() {
+                      try { if (!proc.killed) proc.kill('SIGTERM'); } catch (_) { /* ignore */ }
+                    },
+                    getStdout() { return stdoutAccum; },
+                    getStderr() { return stderrAccum; },
+                  })
+                : reject(new Error(`sibling server did not become healthy in time on ${siblingBase}`))
+            ));
+        }
+      }
+    });
+    proc.stderr.on('data', (chunk) => { stderrAccum += chunk.toString(); });
+    proc.on('error', reject);
+    setTimeout(() => {
+      if (!resolved) reject(new Error('timed out waiting for sibling server to print its bind line'));
+    }, 15000);
   });
 }
 
@@ -538,7 +687,14 @@ function assertNoPasscodeLeakage(payload, label) {
 }
 
 async function runChecks() {
-  const base = `http://127.0.0.1:${PORT}`;
+  // Phase R: BASE is set by startServer() once the child server
+  // prints its bind line. The default `npm run check:api` should
+  // always observe a server on whatever BASE points at; the safety
+  // net in startServer() rejects if the bind line never arrives.
+  if (!BASE) {
+    throw new Error('runChecks called before startServer resolved BASE');
+  }
+  const base = BASE;
 
   // 1. GET /api/health -> 200
   try {
@@ -1616,7 +1772,7 @@ async function main() {
     // ignore
   }
 
-  logLine(`[phase-i] check:api starting on port ${PORT}`);
+  logLine(`[phase-i] check:api starting (REQUESTED_PORT=${REQUESTED_PORT}; will parse actual bind from child stdout)`);
 
   if (process.env.CONFIRM_REAL_VIDEO === '1') {
     logLine('[phase-i] aborting: CONFIRM_REAL_VIDEO=1 is not allowed in check:api');
@@ -1640,7 +1796,7 @@ async function main() {
 
   try {
     await startServer();
-    logLine(`[phase-i] server up on :${PORT}`);
+    logLine(`[phase-i] main server up on ${BASE}`);
   } catch (err) {
     logLine(`[phase-i] failed to start server: ${err.message}`);
     process.exitCode = 1;
@@ -1658,33 +1814,36 @@ async function main() {
   // REQUIRE_SITE_PASSCODE=false and asserts the access path no
   // longer requires passcode (and that /api/runtime-config
   // correctly reflects the new mode).
-  if (process.env.TEST_NO_PASSCODE === '1') {
+  //
+  // Phase R: the sibling server uses the same startServer helper
+  // so it gets its own OS-allocated port (or its own PORT env
+  // override) and never collides with the main server or with
+  // production. We snapshot the main server's BASE so we can
+  // assert against the main server's runtime-config below if
+  // needed, but the new assertions target the sibling server
+  // exclusively.
+  // Phase R: accept either OPT_NO_PASSCODE=1 (canonical) or
+  // TEST_NO_PASSCODE=1 (legacy alias) so operators using either
+  // name get the same no-passcode coverage.
+  const NO_PASSCODE_MODE =
+    process.env.OPT_NO_PASSCODE === '1' || process.env.TEST_NO_PASSCODE === '1';
+  if (NO_PASSCODE_MODE) {
+    logLine(
+      `[phase-i] no-passcode mode enabled (OPT_NO_PASSCODE=${process.env.OPT_NO_PASSCODE || ''} TEST_NO_PASSCODE=${process.env.TEST_NO_PASSCODE || ''})`,
+    );
+    // Phase R: use startSiblingServer so the sibling gets its own
+    // OS-allocated port and its own process handle. We do not
+    // touch `serverProcess` (which still owns the main server),
+    // and we do not rely on `process.env.PORT` inheritance.
+    const mainBase = BASE;
+    let sibling = null;
     try {
-      const priorPort = PORT;
-      const noPassPort = priorPort + 1;
-      const priorProc = serverProcess;
-      serverProcess = null;
-      // Spawn a sibling server with REQUIRE_SITE_PASSCODE=false
-      // and the helper env that disables access guards so we can
-      // exercise the open paths.
-      serverProcess = spawn(process.execPath, [path.resolve(ROOT, 'server', 'index.js')], {
-        cwd: ROOT,
-        env: {
-          ...process.env,
-          PORT: String(noPassPort),
-          NODE_ENV: 'test',
-          REQUIRE_SITE_PASSCODE: 'false',
-          CLOUDFLARE_ACCESS_EXPECTED: 'true',
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
+      sibling = await startSiblingServer({
+        require_site_passcode: false,
+        cloudflare_access_expected: true,
       });
-      serverProcess.stdout.on('data', (chunk) => { serverStdout += chunk.toString(); });
-      serverProcess.stderr.on('data', (chunk) => { serverStderr += chunk.toString(); });
-      serverProcess.on('error', (err) => { logLine(`[phase-i] sibling server error: ${err.message}`); });
-      const siblingReady = await waitForHealth(`http://127.0.0.1:${noPassPort}/api/health`);
-      if (!siblingReady) throw new Error('sibling server did not become healthy in time');
-
-      const siblingBase = `http://127.0.0.1:${noPassPort}`;
+      const siblingBase = sibling.base;
+      logLine(`[phase-i] sibling server up on ${siblingBase} (main on ${mainBase})`);
       // S1: /api/runtime-config reflects the disabled state
       try {
         const r = await fetch(`${siblingBase}/api/runtime-config`);
@@ -1734,11 +1893,26 @@ async function main() {
       } catch (err) {
         recordResult('Phase Q POST /api/video/create without passcode -> 400', false, err.message);
       }
+      // Phase R: confirm port isolation — sibling must NOT have
+      // stolen production's port or the main server's port.
+      try {
+        const siblingUrl = new URL(siblingBase);
+        const mainUrl = new URL(mainBase);
+        recordResult(
+          'Phase R sibling server bound on a different port than main server',
+          siblingUrl.port !== mainUrl.port,
+          `sibling=${siblingUrl.port} main=${mainUrl.port}`,
+        );
+      } catch (err) {
+        recordResult('Phase R sibling server port isolation', false, err.message);
+      }
     } catch (err) {
       logLine(`[phase-i] Phase Q passcode-off mode error: ${err.message}`);
     } finally {
-      try { if (serverProcess && !serverProcess.killed) serverProcess.kill('SIGTERM'); } catch (_) { /* ignore */ }
-      serverProcess = null;
+      // Stop the sibling only; main server keeps running.
+      if (sibling) {
+        try { sibling.stop(); } catch (_) { /* ignore */ }
+      }
     }
   }
 

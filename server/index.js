@@ -34,7 +34,18 @@ const crypto = require('crypto');
 config();
 
 const app = express();
-const PORT = Number(process.env.PORT) || 8789;
+const PORT = (() => {
+  // Phase R: `Number(process.env.PORT) || 8789` was a latent bug
+  // because Number("0") === 0 is falsy and would fall through to
+  // 8789 even when the operator (or our check-api harness)
+  // explicitly asked for port 0 (OS-assigned). Treat unset and
+  // non-numeric the same as the default, but treat "0" as
+  // "OS-assigned".
+  const raw = process.env.PORT;
+  if (raw === undefined || raw === null || raw === '') return 8789;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 8789;
+})();
 // Default to loopback so a fresh deploy is not exposed to the network.
 // Set HOST=0.0.0.0 (or another explicit bind) only when the operator
 // has fronted the process with a reverse proxy or intentionally wants
@@ -483,10 +494,14 @@ app.get('*', (req, res) => {
   return res.status(404).send('Frontend not built. Run `npm run build` and restart server.');
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`MiniMax studio backend running on ${HOST}:${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+  // Phase R: when PORT=0 (OS-assigned), the `${PORT}` interpolation
+  // above would log "127.0.0.1:0" which is useless. Read the
+  // actual bound port from the server handle and log that.
+  const actualPort = server.address().port;
+  console.log(`MiniMax studio backend running on ${HOST}:${actualPort}`);
   console.log(`SQLite db path: ${process.env.DATABASE_PATH || './data/minimax-video-studio.sqlite'}`);
-  console.log(`Health check: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/api/health`);
+  console.log(`Health check: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${actualPort}/api/health`);
   console.log(
     `Polling guardrails: maxAttempts=${pollingConfig.maxAttempts}, maxDurationMinutes=${pollingConfig.maxDurationMinutes}, initialIntervalMs=${pollingConfig.initialIntervalMs}, maxIntervalMs=${pollingConfig.maxIntervalMs}`,
   );
