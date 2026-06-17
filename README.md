@@ -7,12 +7,15 @@ This repository is an open-source starter for cloning and local development. It 
 > You need your own MiniMax Token Plan API Key to run real generation.
 
 Current status:
-- `v0.2.1-alpha` is the **recommended deployment baseline**. Tag
-  points to commit `beacc0d`.
-- `v0.2.0-alpha` (tag points to commit `ada27c9`) is preserved
-  as the "first I2V verified" release. Upgraders are encouraged
-  to jump straight to `v0.2.1-alpha`; the v0.2.0 → v0.2.1 delta
-  is regression fixes only and does not change any user-facing
+- `v0.2.2-alpha` is the **recommended deployment baseline** for
+  Tencent Cloud / any remote deployment. It changes the default
+  bind host to `127.0.0.1` (so a fresh deploy is not exposed to
+  the public network), supports a `HOST` env override, and aligns
+  the `/api/health` `version` field with the deployed tag via
+  `APP_VERSION` / `package.json`.
+- `v0.2.1-alpha` was the previous baseline. Upgraders are
+  encouraged to jump straight to `v0.2.2-alpha`; the delta is
+  deployment hardening only and does not change user-facing
   behaviour.
 - T2V real smoke has been verified once.
 - I2V real smoke has been verified once (Phase J.4, fixture-driven
@@ -845,7 +848,32 @@ Recommended process:
 This repo is an open-source starter. It is designed to be cloned and run
 on a single Tencent Cloud CVM (or any Linux box) for personal use; it is
 **not** intended to be exposed to the public internet without a reverse
-proxy + HTTPS termination, which is out of scope for v0.2.0-alpha.
+proxy + HTTPS termination.
+
+### Default bind host (v0.2.2-alpha)
+
+Starting with `v0.2.2-alpha` the Node server binds to `127.0.0.1:8789`
+by default. This is the safe baseline: a freshly cloned + started
+process is **not** reachable from the public internet even if the host's
+firewall / security group is permissive.
+
+- Default: `HOST=127.0.0.1` (loopback only).
+- Override at your own risk: `HOST=0.0.0.0` (or any specific address)
+  if and only if the process is fronted by a reverse proxy (Caddy,
+  Nginx, Apache) that terminates TLS and forwards to `127.0.0.1:8789`.
+- The systemd unit in `v0.2.2-alpha` sets `HOST=127.0.0.1` explicitly
+  in `Environment=`, so an upgrade that keeps the existing unit does
+  **not** silently rebind to `0.0.0.0`.
+- `/api/health` now reflects the deployed tag via `APP_VERSION`
+  (preferred) or `package.json` (fallback). Pin it from the systemd
+  unit so health-check probes confirm the deployed release.
+
+### Do not expose 8789 directly
+
+Do **not** open port 8789 to the public internet (no Tencent Cloud
+security group rule allowing `0.0.0.0/0 → 8789`, no firewall pinhole).
+Public access must come through a Phase O reverse proxy with HTTPS.
+Until that exists, leave 8789 bound to loopback only.
 
 For the operator-facing, copy-pasteable Tencent Cloud CVM runbook — including
 `git clone`, `.env` creation, `npm install`, `npm run build`, `npm run start`,
@@ -863,12 +891,15 @@ The Phase K readiness report (offline, no real MiniMax submit) is at:
 
 ## Releases
 
-This project keeps both `v0.2.0-alpha` and `v0.2.1-alpha` as
+This project keeps `v0.2.0-alpha`, `v0.2.1-alpha`, and `v0.2.2-alpha` as
 publishable tags. Pick one explicitly:
-
-- `v0.2.1-alpha` — **recommended deployment baseline** (post-release
-  regression fix; `check:api` 72/72 PASS; sticky I2V lock contract
-  preserved across runs).
+- `v0.2.2-alpha` — **recommended deployment baseline** (loopback
+  bind by default, `HOST` env override, `APP_VERSION` health label;
+  `check:api` 72/72 PASS; sticky I2V lock contract preserved across
+  runs). Release notes:
+  [`docs/RELEASE_NOTES_v0.2.2-alpha.md`](docs/RELEASE_NOTES_v0.2.2-alpha.md).
+- `v0.2.1-alpha` — previous baseline. Preserved for the regression
+  audit trail. Upgrade to `v0.2.2-alpha` for any new remote deploy.
   Release notes:
   [`docs/RELEASE_NOTES_v0.2.1-alpha.md`](docs/RELEASE_NOTES_v0.2.1-alpha.md).
 - `v0.2.0-alpha` — first I2V-verified release. Preserved for

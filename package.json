@@ -1,6 +1,6 @@
 {
   "name": "minimax-video-studio",
-  "version": "0.1.0",
+  "version": "0.2.2-alpha",
   "private": true,
   "description": "MiniMax Text-to-Video MVP for Token Plan.",
   "engines": {

@@ -35,7 +35,23 @@ config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 8789;
+// Default to loopback so a fresh deploy is not exposed to the network.
+// Set HOST=0.0.0.0 (or another explicit bind) only when the operator
+// has fronted the process with a reverse proxy or intentionally wants
+// direct LAN exposure.
+const HOST = process.env.HOST || '127.0.0.1';
 const SITE_PASSCODE = String(process.env.SITE_PASSCODE || 'change_me').trim();
+// APP_VERSION lets the operator pin a deployment label (e.g. the
+// git tag). Falls back to package.json version when unset.
+const APP_VERSION =
+  process.env.APP_VERSION ||
+  (() => {
+    try {
+      return require('../package.json').version;
+    } catch (_) {
+      return 'unknown';
+    }
+  })();
 const FRONTEND_DIST = path.resolve(__dirname, '../web/dist');
 const INDEX_HTML = path.join(FRONTEND_DIST, 'index.html');
 
@@ -53,7 +69,7 @@ app.get('/api/health', async (_req, res) => {
     ok: true,
     service: 'minimax-video-studio',
     environment: process.env.NODE_ENV || 'development',
-    version: '0.1.0',
+    version: APP_VERSION,
   });
 });
 
@@ -436,10 +452,10 @@ app.get('*', (req, res) => {
   return res.status(404).send('Frontend not built. Run `npm run build` and restart server.');
 });
 
-app.listen(PORT, () => {
-  console.log(`MiniMax studio backend running on :${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`MiniMax studio backend running on ${HOST}:${PORT}`);
   console.log(`SQLite db path: ${process.env.DATABASE_PATH || './data/minimax-video-studio.sqlite'}`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
+  console.log(`Health check: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/api/health`);
   console.log(
     `Polling guardrails: maxAttempts=${pollingConfig.maxAttempts}, maxDurationMinutes=${pollingConfig.maxDurationMinutes}, initialIntervalMs=${pollingConfig.initialIntervalMs}, maxIntervalMs=${pollingConfig.maxIntervalMs}`,
   );
