@@ -467,94 +467,24 @@ export default function App() {
     : true;
   const imageReady = !isI2V || hasImage;
 
-  useEffect(() => {
-    async function loadConfig() {
-      try {
-        const cfg = await requestJson('/api/video/models', { method: 'GET' }, false);
-        setModelConfig(cfg || FALLBACK_MODEL_CONFIG);
-      } catch {
-        setModelConfig(FALLBACK_MODEL_CONFIG);
-      }
-    }
-    loadConfig();
-  }, []);
-
-  useEffect(() => {
-    async function loadI2vConfig() {
-      try {
-        const cfg = await requestJson('/api/video/i2v/models', { method: 'GET' }, false);
-        if (cfg && cfg.compatibility) {
-          setI2vConfig({ ...FALLBACK_I2V_CONFIG, ...cfg });
-        }
-      } catch {
-        setI2vConfig(FALLBACK_I2V_CONFIG);
-      }
-    }
-    loadI2vConfig();
-  }, []);
-
-  useEffect(() => {
-    async function loadPolling() {
-      try {
-        const cfg = await requestJson('/api/polling/config', { method: 'GET' }, false);
-        setPollingConfig(pickPollingConfig(cfg));
-      } catch {
-        setPollingConfig(FALLBACK_POLLING_CONFIG);
-      }
-    }
-    loadPolling();
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function loadRuntime() {
-      try {
-        const info = await requestJson('/api/health', { method: 'GET' }, false);
-        if (!cancelled) setRuntimeInfo(info && info.ok ? info : 'unknown');
-      } catch {
-        if (!cancelled) setRuntimeInfo('unknown');
-      }
-    }
-    loadRuntime();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function loadRuntimeConfig() {
-      try {
-        const cfg = await requestJson('/api/runtime-config', { method: 'GET' }, false);
-        if (!cancelled) {
-          setRuntimeConfig({
-            require_site_passcode:
-              typeof cfg?.require_site_passcode === 'boolean'
-                ? cfg.require_site_passcode
-                : true,
-            cloudflare_access_expected:
-              typeof cfg?.cloudflare_access_expected === 'boolean'
-                ? cfg.cloudflare_access_expected
-                : false,
-            version: typeof cfg?.version === 'string' ? cfg.version : '',
-          });
-        }
-      } catch {
-        // Fail closed: keep passcode required by default.
-        if (!cancelled) {
-          setRuntimeConfig({
-            require_site_passcode: true,
-            cloudflare_access_expected: false,
-            version: '',
-          });
-        }
-      }
-    }
-    loadRuntimeConfig();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // Phase Q.1: the bootstrap useEffects that call `requestJson` and
+  // other module-level helpers were originally declared here, ABOVE
+  // the helper function declarations. Function declarations are
+  // technically hoisted within the component function scope, but the
+  // production minifier (`esbuild`) can rewrite nested `async
+  // function` declarations to `const x = async () => {}` for tree
+  // shaking, which removes the hoisting and causes the effect
+  // callback to run during commit and hit a TDZ on the const helper.
+  // The minified bundle showed the symptom as
+  // `can't access lexical declaration 'zn' before initialization`
+  // (where `zn` was the minified name of the module-level
+  // `FALLBACK_I2V_CONFIG` constant referenced via the i2v fetch
+  // effect). The fix is to declare all bootstrap effects AFTER every
+  // helper function they reference, so the lexical declarations are
+  // guaranteed to be initialized before the effect callback fires.
+  // The effects themselves are unchanged — they are just relocated
+  // to the post-helpers block below (right before `passcodeRequired`
+  // and the JSX return).
 
   useEffect(() => {
     if (!durations.includes(duration)) {
@@ -1094,6 +1024,99 @@ export default function App() {
     setPrompt(nextPrompt);
     setError('');
   }
+
+  // Phase Q.1: bootstrap effects relocated from the top of the
+  // component function body to here, AFTER every helper function
+  // they reference (requestJson, loadTasks). See the comment block
+  // at the top of App() for the full rationale.
+  useEffect(() => {
+    async function loadConfig() {
+      try {
+        const cfg = await requestJson('/api/video/models', { method: 'GET' }, false);
+        setModelConfig(cfg || FALLBACK_MODEL_CONFIG);
+      } catch {
+        setModelConfig(FALLBACK_MODEL_CONFIG);
+      }
+    }
+    loadConfig();
+  }, []);
+
+  useEffect(() => {
+    async function loadI2vConfig() {
+      try {
+        const cfg = await requestJson('/api/video/i2v/models', { method: 'GET' }, false);
+        if (cfg && cfg.compatibility) {
+          setI2vConfig({ ...FALLBACK_I2V_CONFIG, ...cfg });
+        }
+      } catch {
+        setI2vConfig(FALLBACK_I2V_CONFIG);
+      }
+    }
+    loadI2vConfig();
+  }, []);
+
+  useEffect(() => {
+    async function loadPolling() {
+      try {
+        const cfg = await requestJson('/api/polling/config', { method: 'GET' }, false);
+        setPollingConfig(pickPollingConfig(cfg));
+      } catch {
+        setPollingConfig(FALLBACK_POLLING_CONFIG);
+      }
+    }
+    loadPolling();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRuntime() {
+      try {
+        const info = await requestJson('/api/health', { method: 'GET' }, false);
+        if (!cancelled) setRuntimeInfo(info && info.ok ? info : 'unknown');
+      } catch {
+        if (!cancelled) setRuntimeInfo('unknown');
+      }
+    }
+    loadRuntime();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRuntimeConfig() {
+      try {
+        const cfg = await requestJson('/api/runtime-config', { method: 'GET' }, false);
+        if (!cancelled) {
+          setRuntimeConfig({
+            require_site_passcode:
+              typeof cfg?.require_site_passcode === 'boolean'
+                ? cfg.require_site_passcode
+                : true,
+            cloudflare_access_expected:
+              typeof cfg?.cloudflare_access_expected === 'boolean'
+                ? cfg.cloudflare_access_expected
+                : false,
+            version: typeof cfg?.version === 'string' ? cfg.version : '',
+          });
+        }
+      } catch {
+        // Fail closed: keep passcode required by default.
+        if (!cancelled) {
+          setRuntimeConfig({
+            require_site_passcode: true,
+            cloudflare_access_expected: false,
+            version: '',
+          });
+        }
+      }
+    }
+    loadRuntimeConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const showLoadingMessage = loading ? 'Submitting...' : 'Submit task';
   // Whether the in-app SITE_PASSCODE is required by the server.
