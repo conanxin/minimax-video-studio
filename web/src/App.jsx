@@ -402,6 +402,7 @@ function validateImageUrlInput(value) {
 export default function App() {
   const [modelConfig, setModelConfig] = useState(FALLBACK_MODEL_CONFIG);
   const [i2vConfig, setI2vConfig] = useState(FALLBACK_I2V_CONFIG);
+  const [runtimeInfo, setRuntimeInfo] = useState(null); // { version, environment, service, ok } | null on pending; 'unknown' on failure
   const [pollingConfig, setPollingConfig] = useState(FALLBACK_POLLING_CONFIG);
   const [passcode, setPasscode] = useState('');
   const [generationMode, setGenerationMode] = useState('text_to_video');
@@ -497,6 +498,22 @@ export default function App() {
       }
     }
     loadPolling();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRuntime() {
+      try {
+        const info = await requestJson('/api/health', { method: 'GET' }, false);
+        if (!cancelled) setRuntimeInfo(info && info.ok ? info : 'unknown');
+      } catch {
+        if (!cancelled) setRuntimeInfo('unknown');
+      }
+    }
+    loadRuntime();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -1041,8 +1058,23 @@ export default function App() {
   return (
     <main className="page">
       <header className="hero">
-        <h1>MiniMax Text-to-Video MVP</h1>
-        <p>Phase G: download link freshness indicators and link-freshness UX.</p>
+        <h1>MiniMax Video Studio</h1>
+        <p>
+          T2V and I2V verified · {runtimeInfo && runtimeInfo !== 'unknown' && runtimeInfo.version
+            ? runtimeInfo.version
+            : 'v0.2.2-alpha'} · Cloudflare Access protected
+        </p>
+        <p className="runtime-line">
+          Runtime:{' '}
+          {runtimeInfo && runtimeInfo !== 'unknown' && runtimeInfo.version
+            ? runtimeInfo.version
+            : 'unknown'}
+          {' · '}
+          Service:{' '}
+          {runtimeInfo && runtimeInfo !== 'unknown' && runtimeInfo.environment
+            ? runtimeInfo.environment
+            : 'unknown'}
+        </p>
       </header>
 
       <section className="card">

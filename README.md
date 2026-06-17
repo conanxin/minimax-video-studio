@@ -1,10 +1,19 @@
 ﻿# minimax-video-studio
 
-MiniMax Token Plan text-to-video studio MVP (non-official).
+MiniMax Token Plan T2V + I2V studio MVP (non-official).
 
 This repository is an open-source starter for cloning and local development. It is not an official MiniMax product.
 
 > You need your own MiniMax Token Plan API Key to run real generation.
+
+Public access (current production instance):
+
+- **URL:** `https://mvs.conanxin.com`
+- **Protected by:** Cloudflare Access (browser users see the Access
+  login flow before reaching the studio UI)
+- **Transport:** Cloudflare Tunnel → `cloudflared` → CVM loopback
+  `127.0.0.1:8789`
+- **UI branding aligned with:** `v0.2.2-alpha`
 
 Current status:
 - `v0.2.2-alpha` is the **recommended deployment baseline** for
