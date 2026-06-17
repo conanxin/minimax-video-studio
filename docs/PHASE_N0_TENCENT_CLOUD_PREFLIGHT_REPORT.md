@@ -1,12 +1,14 @@
 # Phase N.0 — Tencent Cloud Deployment Preflight
 
-> **Status**: PASS (local preflight complete; **remote preflight
-> deferred** because the operator has not yet supplied a
-> Tencent Cloud SSH alias / host / user)
-> **Date**: 2026-06-16
+> **Status**: PARTIAL PASS (local preflight PASS; **remote
+> preflight BLOCKED on SSH authentication** — the operator
+> reported the new public key was added to the server's
+> `authorized_keys`, but the server does not accept it)
+> **Date**: 2026-06-17
 > **Repo**: https://github.com/conanxin/minimax-video-studio
 > **Tag**: `v0.2.1-alpha` (the recommended deployment baseline)
-> **HEAD before Phase N.0**: `a3518bc`
+> **HEAD before Phase N.0**: `a3518bc` (then `7eec99f` after
+> the report add)
 
 ---
 
@@ -38,7 +40,9 @@ The phase's deliverables were:
 1. Confirm the local repo is at a clean, deployable commit
    (`a3518bc`) on `main` with `v0.2.1-alpha` reachable.
 2. Confirm whether the local machine has a Tencent Cloud
-   SSH alias / host configured.
+   SSH alias / host configured. (Done — `tencent-minimax`
+   block was added to `~/.ssh/config`; TCP 22 handshake
+   succeeds.)
 3. Confirm the local toolchain (node / npm / git) is
    consistent with the deployment-host expectations documented
    in `docs/TENCENT_CLOUD_DEPLOYMENT_RUNBOOK.md`.
@@ -49,8 +53,10 @@ The phase's deliverables were:
    operator (`MINIMAX_API_KEY` + `SITE_PASSCODE`).
 6. Emit a Phase N.1 minimum deployment plan, **deferred**
    until the operator supplies a real Tencent Cloud SSH
-   target.
-7. Add this report.
+   target AND confirms the new public key is actually in
+   the server's `authorized_keys` for the right user.
+7. Add this report (now updated to reflect the SSH auth
+   blocker).
 8. Push to `origin main` (no tag changes).
 
 ---
@@ -149,61 +155,153 @@ deployment host. The deployment-host check is in §6 below
 
 ---
 
-## 6. Remote preflight (deferred)
+## 6. Remote preflight (BLOCKED on SSH authentication)
 
-The operator brief said: *"如果你已有腾讯云 SSH alias，请只
-检查连接可用性，不要输出敏感信息"* and *"如果没有明确 SSH
-alias 或 host：停止，回复我需要提供腾讯云 SSH alias /
-host / user，不猜测服务器信息"*.
+The local SSH `Host tencent-minimax` block was added to
+`~/.ssh/config` and resolves correctly:
 
-The local SSH configuration was inspected:
-
-- `/home/conanxin/.ssh/config` contains exactly **one** Host
-  block: `cloud-openclaw` (which points to a different
-  OpenClaw deployment host — it is NOT a Tencent Cloud
-  host and MUST NOT be used for minimax-video-studio
-  preflight).
-- `~/.ssh/known_hosts` contains 6 hashed entries (no
-  plaintext hostnames visible).
-- No `tencent*` / `qcloud*` / `cvm*` / `TENCENT*`
-  environment variable is set.
-- No documentation under `docs/` references a specific
-  Tencent Cloud host, IP, or alias.
-
-**Conclusion**: the operator has not (yet) supplied a
-Tencent Cloud SSH alias, host, IP, or user. Phase N.0
-therefore **defers the remote preflight** and does not
-attempt any SSH connection to a guessed host.
-
-When the operator provides a real SSH target, the following
-remote checks should be run (per the operator brief, with
-no sensitive output):
-
-```bash
-# 1. Basic identity / tooling
-ssh <TENCENT_CLOUD_ALIAS_OR_HOST> \
-  "hostname; pwd; node -v || true; npm -v || true; git --version || true; \
-   systemctl --version | head -1 || true"
-
-# 2. Target deployment path availability (DO NOT CLONE)
-ssh <TENCENT_CLOUD_ALIAS_OR_HOST> \
-  "test -d \$HOME/apps && test ! -e \$HOME/apps/minimax-video-studio \
-   && echo 'path_available' || echo 'path_state:<reason>'"
-
-# 3. Port 8789 collision check
-ssh <TENCENT_CLOUD_ALIAS_OR_HOST> \
-  "ss -ltnp 2>/dev/null | grep ':8789' || echo 'port_8789:free'"
-
-# 4. Existing systemd unit check
-ssh <TENCENT_CLOUD_ALIAS_OR_HOST> \
-  "systemctl --user status minimax-video-studio.service 2>/dev/null \
-   | head -10 || echo 'service:not_found'"
+```text
+$ ssh -G tencent-minimax | grep -E '^(hostname|user|port|identityfile|identitiesonly) '
+user root
+hostname 118.195.129.137
+port 22
+identitiesonly yes
+identityfile ~/.ssh/tencent_minimax_ed25519
 ```
 
-The "DO NOT CLONE" instruction is preserved: the preflight
-is read-only. Cloning, `.env` creation, `npm install`,
-`npm run build`, `npm run start`, and `systemctl enable`
-all belong to Phase N.1, not Phase N.0.
+TCP to port 22 of `118.195.129.137` succeeds; the SSH
+handshake completes and the server presents its host key
+(`ssh-ed25519 SHA256:61UvJX/VBGbzNchHjKdpxoeyaeYZz52UUnl6UhFMYnQ`).
+The local client offers the new ED25519 key:
+
+```text
+debug1: Offering public key: /home/conanxin/.ssh/tencent_minimax_ed25519 ED25519 SHA256:qvIiCILXoAclVxHfSbyHtfbwLNFAr0HIbcUAQLCiyn4 explicit
+debug1: Authentications that can continue: publickey,password
+debug1: No more authentication methods to try.
+root@118.195.129.137: Permission denied (publickey,password).
+```
+
+**The server does not accept the offered key.** This is the
+honest signal: the public key
+`SHA256:qvIiCILXoAclVxHfSbyHtfbwLNFAr0HIbcUAQLCiyn4` is
+**not** present in the server's `authorized_keys` for the
+user we are trying to log in as (`root`).
+
+The operator reported *"新公钥已加入服务器 authorized_keys"*
+but the evidence above contradicts that. The most likely
+causes are:
+
+1. **Wrong user home.** We are configured to ssh as `root`
+   (`User root` in `~/.ssh/config`). The new public key
+   may have been added to a different user's
+   `~/.ssh/authorized_keys` (e.g. `ubuntu` — the typical
+   default user for a Tencent Cloud Ubuntu CVM image). On
+   modern Linux, `root` and `ubuntu` are different accounts
+   with different home directories
+   (`/root/.ssh/authorized_keys` vs.
+   `/home/ubuntu/.ssh/authorized_keys`).
+2. **Key added to a different key alias.** The key file
+   generated for this project is
+   `~/.ssh/tencent_minimax_ed25519` with comment
+   `minimax-video-studio-tencent`. If a different key file
+   was uploaded to the CVM (e.g. the pre-existing
+   `~/.ssh/cloud_openclaw` for `cloud-openclaw`), that key
+   is a different one and would not match the offer we
+   make.
+3. **`authorized_keys` permissions / ownership.** On the
+   server side, the file must be `600` and owned by the
+   login user; the parent directory must be `700` and owned
+   by the same user. If the CVM-side tooling used
+   `wget | bash` or similar, permissions or ownership may
+   be wrong and sshd will silently ignore the file.
+4. **sshd config disallows root login.** Some CVM images
+   set `PermitRootLogin prohibit-password` and require
+   `PubkeyAuthentication yes` AND a root key. Others
+   default `PermitRootLogin no` entirely. The local probe
+   shows `publickey,password` are both offered, so the
+   server does not explicitly block root, but the key still
+   has to match.
+5. **The CVM is the OpenClaw host, not a fresh Tencent
+   CVM.** The IP `118.195.129.137` matches the
+   `cloud-openclaw` SSH config entry from earlier
+   inspection. If this is the *same* machine, then the
+   "minimax-video-studio" deployment would be co-located
+   with the OpenClaw deployment, and the new public key
+   would have to be added to the existing
+   `cloud_openclaw`-authorized account (likely `ubuntu`,
+   not `root`).
+
+**Phase N.0 cannot preflight a remote host it cannot ssh
+into.** No probe of `node` / `npm` / `git` / `systemd` /
+port 8789 / `~/apps/` was possible. The remote preflight
+remains blocked until the operator confirms the public key
+is in the right place on the server.
+
+The minimum fix the operator should run, **outside the
+project repo, on the deployment host**:
+
+```bash
+# On the deployment host, as the user that will receive
+# the key. Replace <USERNAME> with the actual login user
+# (root, ubuntu, or whatever ssh -G tencent-minimax shows
+# for the User field).
+
+# 1. Confirm where the key should go
+echo "Login user: $(whoami)"
+echo "Home:       $HOME"
+test -d "$HOME/.ssh" || mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+
+# 2. Add the public key. Get the exact line from the
+#    local machine via:
+#      cat ~/.ssh/tencent_minimax_ed25519.pub
+#    and append it to authorized_keys. (The line starts
+#    with `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...` and
+#    ends with `minimax-video-studio-tencent`. The
+#    fingerprint must be
+#    SHA256:qvIiCILXoAclVxHfSbyHtfbwLNFAr0HIbcUAQLCiyn4.)
+#    Then:
+test -s "$HOME/.ssh/authorized_keys" && \
+  echo "" >> "$HOME/.ssh/authorized_keys"
+cat ~/.ssh/tencent_minimax_ed25519.pub \
+  >> "$HOME/.ssh/authorized_keys"
+
+# 3. Lock down permissions (sshd is strict about this)
+chmod 600 "$HOME/.ssh/authorized_keys"
+chmod 700 "$HOME/.ssh"
+chown -R "$(whoami):$(id -gn)" "$HOME/.ssh"
+
+# 4. Verify (read-only)
+ssh-keygen -lf "$HOME/.ssh/authorized_keys"
+# expect: a line whose fingerprint is
+#         SHA256:qvIiCILXoAclVxHfSbyHtfbwLNFAr0HIbcUAQLCiyn4
+# If it is missing or has a different fingerprint, the
+# wrong public key was appended.
+```
+
+If the operator confirms the public key is in place for
+the right user, the Phase N.0 §6 remote probe can be
+re-run as:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=10 tencent-minimax \
+  "hostname; whoami; pwd;
+   node -v || true; npm -v || true;
+   git --version || true;
+   systemctl --version | head -1 || true;
+   test -d \$HOME/apps && echo apps_dir_exists=yes \
+     || echo apps_dir_exists=no;
+   test -d \$HOME/apps/minimax-video-studio \
+     && echo project_dir_exists=yes \
+     || echo project_dir_exists=no;
+   ss -ltnp 2>/dev/null | grep ':8789' \
+     || echo port_8789_free_or_not_listening;
+   systemctl --user status minimax-video-studio.service --no-pager \
+     2>&1 | head -8 || true"
+```
+
+No remote probe was executed in this phase beyond the
+ssh-key offer and the server's response (which is
+authentication metadata, not file contents).
 
 ---
 
@@ -347,30 +445,44 @@ opened. The local SQLite task store was not read.
 
 ## 11. Current blockers (operator action required)
 
-1. **Tencent Cloud SSH target is missing.** Phase N.0 cannot
-   preflight a remote host it cannot reach. The operator
-   must supply one of:
-   - A `Host <alias>` block in `~/.ssh/config` that points
-     to the CVM (e.g. `Host tencent-cvm`), or
-   - A direct host / user / IP / key path that the operator
-     is willing to add to `~/.ssh/config`, or
-   - An explicit decision to skip the remote preflight and
-     go straight to Phase N.1 with the operator performing
-     the preflight checks themselves.
-2. **`.env` values are operator-only.** They will not be
+1. **SSH public key not in the server's `authorized_keys`.**
+   Phase N.0 added the `tencent-minimax` alias and the
+   local client successfully offers the new key, but the
+   server rejects it. The minimum fix the operator must
+   run, **outside the project repo, on the deployment
+   host**, is in §6 above (the `>> authorized_keys` +
+   `chmod 600` + `chown` + `ssh-keygen -lf` verification
+   block). The exact public key fingerprint the server
+   must list is
+   `SHA256:qvIiCILXoAclVxHfSbyHtfbwLNFAr0HIbcUAQLCiyn4`.
+2. **Which user the new key should go to.** The
+   `tencent-minimax` alias is configured to log in as
+   `root`. If the new public key was actually added to
+   `ubuntu`'s `~/.ssh/authorized_keys` instead, the
+   fix is either:
+   (a) re-append the public key to `/root/.ssh/authorized_keys`
+       on the server (and confirm `PermitRootLogin` is not
+       `no` in `sshd_config`); or
+   (b) change `User` in `~/.ssh/config` to `ubuntu` if that
+       is the account that has the key.
+3. **`.env` values are operator-only.** They will not be
    generated by the deployment script. The operator must
    fill `MINIMAX_API_KEY` and `SITE_PASSCODE` by hand in
    the editor step.
-3. **The systemd unit file in the Phase K runbook uses
+4. **The systemd unit file in the Phase K runbook uses
    placeholders.** The operator must replace `<APP_USER>`,
    `<APP_GROUP>`, and `<REPO_DIR>` (and optionally pin
    `ExecStart` to an absolute node binary path) before
    `systemctl daemon-reload`.
 
+Items 1 and 2 are blocking the entire Phase N.0 remote
+preflight. Items 3 and 4 are pre-flight paperwork that
+becomes blocking only at Phase N.1.
+
 No other blockers are known. The local repo, the local
 toolchain, and the local working tree are all in a state
-where Phase N.1 can start as soon as the operator supplies
-the SSH target and authorises the deployment.
+where Phase N.0 can resume the moment the operator confirms
+the public key is in the right place.
 
 ---
 
