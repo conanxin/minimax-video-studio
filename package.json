@@ -16,6 +16,7 @@
     "smoke:i2v": "node scripts/smoke-image-to-video.js",
     "import:local-smoke": "node scripts/import-local-smoke-to-db.js",
     "check:api": "node scripts/check-api-regression.js",
+    "check:frontend": "node scripts/check-frontend-runtime.js",
     "check:open-source": "node scripts/check-open-source.js",
     "check:minimax-auth": "node scripts/check-minimax-auth.js",
     "fixture:i2v:generate": "node scripts/generate-i2v-fixture.js",

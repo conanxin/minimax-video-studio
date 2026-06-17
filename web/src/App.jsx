@@ -1,403 +1,59 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+﻿// Phase Q.2: pure module-level constants and state-free utilities were
+// extracted into `./constants.js` and `./utils.js` respectively, then
+// re-imported below. This guarantees that every lexical binding the
+// component depends on is initialized as an ES-module top-level
+// `const`/`function` before the first render of `App()`, which removes
+// the entire class of "TDZ on minified const" bugs that bit us in
+// Phase Q / Phase Q.1.
 
-const FALLBACK_POLLING_CONFIG = {
-  initialIntervalMs: 10_000,
-  maxIntervalMs: 30_000,
-  maxAttempts: 60,
-  maxDurationMinutes: 20,
-  backoffFactor: 1.5,
-  jitterMs: 1500,
-};
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  FALLBACK_POLLING_CONFIG,
+  FALLBACK_MODEL_CONFIG,
+  FALLBACK_I2V_CONFIG,
+  GENERATION_MODE_OPTIONS,
+  GENERATION_MODE_LABEL,
+  I2V_FORMAT_LABELS,
+  STATUS_TEXT,
+  STATUS_FILTER_OPTIONS,
+  HISTORY_PAGE_SIZE,
+  DOWNLOAD_URL_STATUS_TEXT,
+  DOWNLOAD_URL_STATUS_PILL_TEXT,
+  DEFAULT_RUNTIME_CONFIG,
+} from './constants.js';
+import {
+  formatBytes,
+  formatAgeLabel,
+  normalizeStatus,
+  isTerminalStatus,
+  shortId,
+  shortTaskId,
+  countOccurrences,
+  formatReadableTime,
+  summarizePrompt,
+  groupTasksByDate,
+  buildModelList,
+  getDurations,
+  getResolutionOptions,
+  supportHint,
+  pickPollingConfig,
+  inspectImageFile,
+  validateImageUrlInput,
+  buildQueryString,
+} from './utils.js';
 
-const FALLBACK_MODEL_CONFIG = {
-  defaults: {
-    model: 'MiniMax-Hailuo-2.3',
-    duration: 6,
-    resolution: '768P',
-    prompt_optimizer: true,
-  },
-  max_prompt_length: 2000,
-  camera_moves: ['固定', '推进', '拉远', '左摇', '右摇', '上升', '下降', '跟随'],
-  compatibility: {
-    'MiniMax-Hailuo-2.3': {
-      '6': ['768P', '1080P'],
-      '10': ['768P'],
-    },
-    'MiniMax-Hailuo-02': {
-      '6': ['768P', '1080P'],
-      '10': ['768P'],
-    },
-    'T2V-01-Director': {
-      '6': ['720P'],
-    },
-    'T2V-01': {
-      '6': ['720P'],
-    },
-  },
-};
-
-// Frontend I2V fallback. The authoritative copy lives at
-// /api/video/i2v/models; this constant is only used when the network call
-// fails so the UI still knows the basic constraints.
-const FALLBACK_I2V_CONFIG = {
-  defaults: {
-    model: 'MiniMax-Hailuo-2.3',
-    duration: 6,
-    resolution: '768P',
-    prompt_optimizer: true,
-  },
-  max_prompt_length: 2000,
-  image_constraints: {
-    formats: ['jpg', 'jpeg', 'png', 'webp'],
-    max_bytes: 20971520,
-    min_short_side_px: 300,
-    aspect_ratio_min: 0.4,
-    aspect_ratio_max: 2.5,
-    input_types: ['public_url', 'data_url'],
-  },
-  compatibility: {
-    'MiniMax-Hailuo-2.3': { '6': ['768P', '1080P'], '10': ['768P'] },
-    'MiniMax-Hailuo-2.3-Fast': { '6': ['768P', '1080P'], '10': ['768P'] },
-    'MiniMax-Hailuo-02': { '6': ['512P', '768P', '1080P'], '10': ['512P', '768P'] },
-    'I2V-01-Director': { '6': ['720P'] },
-    'I2V-01-live': { '6': ['720P'] },
-    'I2V-01': { '6': ['720P'] },
-  },
-};
-
-const GENERATION_MODE_OPTIONS = [
-  { value: 'text_to_video', label: '文生视频' },
-  { value: 'image_to_video', label: '图生视频' },
-];
-
-const GENERATION_MODE_LABEL = {
-  text_to_video: '文生视频',
-  image_to_video: '图生视频',
-};
-
-const I2V_FORMAT_LABELS = {
-  'image/jpeg': 'JPG/JPEG',
-  'image/png': 'PNG',
-  'image/webp': 'WebP',
-};
-
-function formatBytes(bytes) {
-  if (!Number.isFinite(bytes) || bytes < 0) return '-';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-const STATUS_TEXT = {
-  Preparing: '准备中',
-  Queueing: '排队中',
-  Processing: '生成中',
-  Success: '成功',
-  Fail: '失败',
-  Unknown: '未知',
-};
-
-const STATUS_FILTER_OPTIONS = [
-  { value: 'all', label: '全部' },
-  { value: 'Success', label: '成功' },
-  { value: 'Fail', label: '失败' },
-  { value: 'in_progress', label: '生成中' },
-];
-
-const HISTORY_PAGE_SIZE = 20;
-
-const DOWNLOAD_URL_STATUS_TEXT = {
-  fresh: '下载链接可用',
-  aging: '链接较久，建议刷新',
-  stale: '链接可能已过期',
-  absent: '未获取下载链接',
-  unknown: '暂无链接状态',
-};
-
-const DOWNLOAD_URL_STATUS_PILL_TEXT = {
-  fresh: 'fresh',
-  aging: 'aging',
-  stale: 'stale',
-  absent: 'absent',
-  unknown: 'unknown',
-};
-
-function formatAgeLabel(hours) {
-  if (hours === null || hours === undefined) return null;
-  const numeric = Number(hours);
-  if (!Number.isFinite(numeric)) return null;
-  if (numeric < 1) {
-    const minutes = Math.max(1, Math.round(numeric * 60));
-    return `${minutes} 分钟前刷新`;
-  }
-  if (numeric < 24) {
-    const rounded = Math.round(numeric);
-    return `${rounded} 小时前刷新`;
-  }
-  const days = Math.round(numeric / 24);
-  return `${days} 天前刷新`;
-}
-
-function normalizeStatus(status) {
-  const value = String(status || '').toLowerCase();
-  if (!value) return 'Unknown';
-  const map = {
-    preparing: 'Preparing',
-    queueing: 'Queueing',
-    processing: 'Processing',
-    running: 'Processing',
-    success: 'Success',
-    completed: 'Success',
-    fail: 'Fail',
-    failed: 'Fail',
-    error: 'Fail',
-  };
-  return map[value] || value[0].toUpperCase() + value.slice(1).toLowerCase();
-}
-
-function isTerminalStatus(status) {
-  return normalizeStatus(status) === 'Success' || normalizeStatus(status) === 'Fail';
-}
-
-function shortId(value) {
-  if (!value) return '-';
-  if (value.length <= 16) return value;
-  return `${value.slice(0, 8)}...${value.slice(-6)}`;
-}
-
-function shortTaskId(taskId) {
-  return shortId(taskId);
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function countOccurrences(text, token) {
-  const regex = new RegExp(escapeRegExp(token), 'gi');
-  const matches = String(text).match(regex);
-  return matches ? matches.length : 0;
-}
-
-function formatReadableTime(value) {
-  if (!value) return '-';
-  try {
-    return new Date(value).toLocaleString('en-US');
-  } catch {
-    return value;
-  }
-}
-
-function summarizePrompt(value, max = 80) {
-  if (!value) return '(empty prompt)';
-  const flat = String(value).replace(/\s+/g, ' ').trim();
-  if (flat.length <= max) return flat;
-  return `${flat.slice(0, max - 1)}…`;
-}
-
-function startOfLocalDay(date) {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
-}
-
-function groupLabelForIso(value) {
-  if (!value) return 'Earlier';
-  const target = new Date(value);
-  if (Number.isNaN(target.getTime())) return 'Earlier';
-  const today = startOfLocalDay(new Date());
-  const taskDay = startOfLocalDay(target);
-  const diffDays = Math.round((today - taskDay) / (1000 * 60 * 60 * 24));
-  if (diffDays <= 0) return 'Today';
-  if (diffDays === 1) return 'Yesterday';
-  return 'Earlier';
-}
-
-const GROUP_ORDER = ['Today', 'Yesterday', 'Earlier'];
-
-function groupTasksByDate(tasks) {
-  const groups = new Map();
-  for (const task of tasks || []) {
-    const label = groupLabelForIso(task.updated_at || task.created_at);
-    if (!groups.has(label)) groups.set(label, []);
-    groups.get(label).push(task);
-  }
-  return GROUP_ORDER.filter((label) => groups.has(label)).map((label) => ({
-    label,
-    tasks: groups.get(label),
-  }));
-}
-
-function buildModelList(config) {
-  return Object.keys(config.compatibility || {});
-}
-
-function getDurations(config, model) {
-  const durations = Object.keys(config.compatibility?.[model] || {});
-  const sorted = durations.map((value) => Number(value)).filter((value) => Number.isFinite(value));
-  return sorted.sort((a, b) => a - b);
-}
-
-function getResolutionOptions(config, model, duration) {
-  return config.compatibility?.[model]?.[String(duration)] || [];
-}
-
-function supportHint(config, model, duration) {
-  const item = config.compatibility?.[model] || {};
-  const parts = Object.entries(item).map(([sec, resolutions]) => `${sec}s: ${resolutions.join(' / ')}`);
-  return `${model} supports: ${parts.join('; ')}`;
-}
-
-function clampNumber(value, fallback, min, max) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return fallback;
-  if (min !== undefined && numeric < min) return min;
-  if (max !== undefined && numeric > max) return max;
-  return numeric;
-}
-
-function pickPollingConfig(remote) {
-  const fallback = FALLBACK_POLLING_CONFIG;
-  if (!remote || typeof remote !== 'object') return fallback;
-  return {
-    initialIntervalMs: clampNumber(remote.initialIntervalMs, fallback.initialIntervalMs, 1000, 5 * 60_000),
-    maxIntervalMs: clampNumber(remote.maxIntervalMs, fallback.maxIntervalMs, 1000, 10 * 60_000),
-    maxAttempts: clampNumber(remote.maxAttempts, fallback.maxAttempts, 1, 1000),
-    maxDurationMinutes: clampNumber(remote.maxDurationMinutes, fallback.maxDurationMinutes, 1, 240),
-    backoffFactor: clampNumber(remote.backoffFactor, fallback.backoffFactor, 1, 5),
-    jitterMs: clampNumber(remote.jitterMs, fallback.jitterMs, 0, 60_000),
-  };
-}
-
-// Inspect an image file (FileReader -> Data URL + Image element) and
-// return a Promise with a structured result. Always resolves; never
-// rejects. Callers should treat ok=false as a soft validation failure
-// (grey out submit, show the reason).
-function inspectImageFile(file) {
-  return new Promise((resolve) => {
-    if (!file) {
-      resolve({ ok: false, reason: 'no_file', error: 'No file provided.' });
-      return;
-    }
-    const mime = (file.type || '').toLowerCase();
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(mime)) {
-      resolve({
-        ok: false,
-        reason: 'unsupported_mime',
-        error: `Unsupported image type: ${mime || 'unknown'}. Allowed: JPG/JPEG, PNG, WebP.`,
-      });
-      return;
-    }
-    if (file.size > 20 * 1024 * 1024) {
-      resolve({
-        ok: false,
-        reason: 'too_large',
-        error: `Image is too large: ${formatBytes(file.size)} > 20 MB.`,
-      });
-      return;
-    }
-    const reader = new FileReader();
-    reader.onerror = () => {
-      resolve({ ok: false, reason: 'read_error', error: 'Failed to read the image file.' });
-    };
-    reader.onload = () => {
-      const dataUrl = String(reader.result || '');
-      const img = new Image();
-      img.onerror = () => {
-        resolve({
-          ok: false,
-          reason: 'decode_error',
-          error: 'Could not decode the image. Try a different file.',
-        });
-      };
-      img.onload = () => {
-        const width = img.naturalWidth || img.width;
-        const height = img.naturalHeight || img.height;
-        const shortSide = Math.min(width, height);
-        const longSide = Math.max(width, height);
-        const ratio = height > 0 && width > 0 ? longSide / shortSide : 0;
-        const minShort = FALLBACK_I2V_CONFIG.image_constraints.min_short_side_px;
-        const ratioMin = FALLBACK_I2V_CONFIG.image_constraints.aspect_ratio_min;
-        const ratioMax = FALLBACK_I2V_CONFIG.image_constraints.aspect_ratio_max;
-        if (shortSide < minShort) {
-          resolve({
-            ok: false,
-            reason: 'too_small',
-            error: `Image short side is ${shortSide}px; must be at least ${minShort}px.`,
-            dataUrl,
-            width,
-            height,
-            mime,
-            sizeBytes: file.size,
-          });
-          return;
-        }
-        if (ratio < ratioMin || ratio > ratioMax) {
-          resolve({
-            ok: false,
-            reason: 'bad_aspect',
-            error: `Aspect ratio ${ratio.toFixed(2)} outside 2:5 to 5:2 (${ratioMin}–${ratioMax}).`,
-            dataUrl,
-            width,
-            height,
-            mime,
-            sizeBytes: file.size,
-          });
-          return;
-        }
-        resolve({
-          ok: true,
-          dataUrl,
-          width,
-          height,
-          mime,
-          sizeBytes: file.size,
-          ratio,
-        });
-      };
-      img.src = dataUrl;
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-function validateImageUrlInput(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return { ok: false, error: 'first_frame_image is required for image_to_video.' };
-  if (/^data:image\/(jpeg|jpg|png|webp);base64,/i.test(raw)) {
-    return { ok: true, kind: 'data_url', source: raw };
-  }
-  if (/^https:\/\//i.test(raw)) {
-    try {
-      const u = new URL(raw);
-      if (u.protocol.toLowerCase() !== 'https:') {
-        return { ok: false, error: 'Only https:// public URLs are allowed.' };
-      }
-      const host = u.hostname || '';
-      if (
-        host === 'localhost' ||
-        /^127\./.test(host) ||
-        /^10\./.test(host) ||
-        /^192\.168\./.test(host) ||
-        /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
-        host === '0.0.0.0'
-      ) {
-        return { ok: false, error: 'Private or localhost URLs are not allowed.' };
-      }
-      return { ok: true, kind: 'public_url', host, source: raw };
-    } catch (_err) {
-      return { ok: false, error: 'Invalid URL format.' };
-    }
-  }
-  if (/^data:image\//i.test(raw)) {
-    return { ok: false, error: 'Unsupported Data URL image format. Allowed: JPG/JPEG, PNG, WebP.' };
-  }
-  if (/^http:\/\//i.test(raw)) {
-    return { ok: false, error: 'http:// URLs are not allowed. Use https://.' };
-  }
-  if (/^file:\/\//i.test(raw)) {
-    return { ok: false, error: 'file:// URLs are not allowed. Upload the image instead.' };
-  }
-  return { ok: false, error: 'Provide an https:// URL or upload an image.' };
-}
+// `formatAgeLabel` and a handful of others are used only inside JSX,
+// but importing them all from utils.js keeps the module surface
+// explicit and prevents accidental shadowing inside App().
+void formatAgeLabel;
+void isTerminalStatus;
+void shortId;
+void shortTaskId;
+void countOccurrences;
+void formatReadableTime;
+void summarizePrompt;
+void groupTasksByDate;
+void supportHint;
 
 export default function App() {
   const [modelConfig, setModelConfig] = useState(FALLBACK_MODEL_CONFIG);
@@ -467,6 +123,21 @@ export default function App() {
     : true;
   const imageReady = !isI2V || hasImage;
 
+  // Phase Q.2: derive `passcodeRequired` and `passcodeReady` HERE,
+  // BEFORE any useEffect registration. React evaluates the deps
+  // array of each useEffect eagerly during render; if the deps array
+  // references a `const` whose declaration lives further down the
+  // function body, the reference hits TDZ. The minified bundle
+  // symptom is `ReferenceError: Cannot access 'Zn' before
+  // initialization` where `Zn` is the minified name of
+  // `passcodeReady`. The `accessProtected` and `passcodeRequired`
+  // values are also reused inside JSX below, so they live here too.
+  const passcodeRequired =
+    !runtimeConfig || runtimeConfig.require_site_passcode === true;
+  const accessProtected =
+    runtimeConfig && runtimeConfig.cloudflare_access_expected === true;
+  const passcodeReady = !passcodeRequired || Boolean(passcode && passcode.trim());
+
   // Phase Q.1: the bootstrap useEffects that call `requestJson` and
   // other module-level helpers were originally declared here, ABOVE
   // the helper function declarations. Function declarations are
@@ -485,42 +156,23 @@ export default function App() {
   // The effects themselves are unchanged — they are just relocated
   // to the post-helpers block below (right before `passcodeRequired`
   // and the JSX return).
+  //
+  // Phase Q.2: the same relocation is now extended to the
+  // `durations.includes(duration)`, `resolutions.includes(resolution)`,
+  // `loadTasks()`, silent `loadTasks({silent:true})`, and
+  // `pollingTimer` cleanup effects, all of which reference helpers
+  // (`buildModelList`/`getDurations`/etc. and `loadTasks`) that are
+  // declared further down. With esbuild's `keepNames: true` +
+  // `target: 'es2020'` these are still safe under source-order
+  // hoisting, but ANY nested `async function` declared inside the
+  // component body and used by an effect registered above it is a
+  // latent TDZ waiting to bite the next time someone reorders the
+  // file. Centralizing every `useEffect` below every helper is the
+  // structural fix.
 
-  useEffect(() => {
-    if (!durations.includes(duration)) {
-      setDuration(durations[0] || activeConfig.defaults.duration);
-    }
-  }, [model, durations, duration, activeConfig]);
+  // (No useEffects above this line. They all live in the post-helpers
+  // block — search for "Phase Q.2: all useEffects relocated".)
 
-  useEffect(() => {
-    if (!resolutions.includes(resolution)) {
-      setResolution(resolutions[0] || activeConfig.defaults.resolution);
-    }
-  }, [duration, durations, model, resolutions, resolution, activeConfig]);
-
-  useEffect(() => {
-    if (!passcodeReady) return;
-    loadTasks();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [passcodeReady, historyStatus, historySearch]);
-
-  useEffect(() => {
-    if (!passcodeReady) return;
-    if (!currentTask && !selectedTask) return;
-    loadTasks({ silent: true });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTask, currentTask, passcodeReady]);
-
-  useEffect(() => {
-    return () => {
-      if (pollingTimer.current) {
-        clearTimeout(pollingTimer.current);
-      }
-    };
-  }, []);
-
-  // When the user switches modes, reset model/duration/resolution to the
-  // new matrix defaults so the dropdowns stay sensible.
   function handleModeChange(nextMode) {
     if (nextMode === generationMode) return;
     setGenerationMode(nextMode);
@@ -1118,17 +770,52 @@ export default function App() {
     };
   }, []);
 
+  // Phase Q.2: all useEffects relocated to here. Every effect in the
+  // component body now lives BELOW every helper function it might
+  // transitively reference (loadTasks, requestJson, buildModelList,
+  // getDurations, etc.). The structural rule is: no useEffect may be
+  // declared above any function it references.
+
+  useEffect(() => {
+    if (!durations.includes(duration)) {
+      setDuration(durations[0] || activeConfig.defaults.duration);
+    }
+  }, [model, durations, duration, activeConfig]);
+
+  useEffect(() => {
+    if (!resolutions.includes(resolution)) {
+      setResolution(resolutions[0] || activeConfig.defaults.resolution);
+    }
+  }, [duration, durations, model, resolutions, resolution, activeConfig]);
+
+  useEffect(() => {
+    if (!passcodeReady) return;
+    loadTasks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [passcodeReady, historyStatus, historySearch]);
+
+  useEffect(() => {
+    if (!passcodeReady) return;
+    if (!currentTask && !selectedTask) return;
+    loadTasks({ silent: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTask, currentTask, passcodeReady]);
+
+  useEffect(() => {
+    return () => {
+      if (pollingTimer.current) {
+        clearTimeout(pollingTimer.current);
+      }
+    };
+  }, []);
+
+  // Phase Q.2: `passcodeReady`, `passcodeRequired`, and
+  // `accessProtected` are declared at the top of the component
+  // function body (see the Phase Q.2 comment block near
+  // `imageReady`) so React's eager useEffect deps evaluation never
+  // hits a TDZ on those names.
+
   const showLoadingMessage = loading ? 'Submitting...' : 'Submit task';
-  // Whether the in-app SITE_PASSCODE is required by the server.
-  // We default to "required" (true) until /api/runtime-config tells
-  // us otherwise; the server is also the source of truth.
-  const passcodeRequired =
-    !runtimeConfig || runtimeConfig.require_site_passcode === true;
-  const accessProtected =
-    runtimeConfig && runtimeConfig.cloudflare_access_expected === true;
-  // A request may proceed if passcode is not required OR a passcode
-  // is present.
-  const passcodeReady = !passcodeRequired || Boolean(passcode && passcode.trim());
   const terminalStatus = selectedTask ? normalizeStatus(selectedTask.status) : null;
   const hasFileId = Boolean(selectedTask?.file_id);
   const hasDownloadUrl = Boolean(selectedTask?.download_url);
