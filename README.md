@@ -87,7 +87,9 @@ Current status:
   params buttons in the task detail panel
 - Task compatibility validation before submit
 - Video playback + download link when available
-- Simple page passcode protection (`SITE_PASSCODE`)
+- Optional in-app passcode protection (`SITE_PASSCODE`); toggleable
+  with `REQUIRE_SITE_PASSCODE` when the deployment is already gated
+  upstream by Cloudflare Access or an equivalent IdP-fronted proxy
 - SQLite task storage
 - Offline-friendly local setup
 - `npm run check:api` for offline API regression checks (no real
@@ -191,6 +193,8 @@ npm run dev
 | `DATABASE_PATH` | SQLite path | `./data/minimax-video-studio.sqlite` |
 | `MINIMAX_API_BASE` | MiniMax API base URL | `https://api.minimaxi.com` |
 | `CONFIRM_REAL_VIDEO` | `0` for dry-run smoke, `1` to call real API | `0` |
+| `REQUIRE_SITE_PASSCODE` | When `true` (default) `/api/tasks`, `/api/video/create`, `/api/video/task/:id`, `/api/video/file/:id`, `/api/video/file/:id/refresh` all require `SITE_PASSCODE`. Set to `false` to skip the passcode middleware entirely (intended for deployments already gated by Cloudflare Access). Accepted off values: `false` / `0` / `no` / `off`. | `true` |
+| `CLOUDFLARE_ACCESS_EXPECTED` | UI hint surfaced through `/api/runtime-config` so the frontend can render "Access is protected by Cloudflare Access" instead of asking for a passcode. Does NOT change any server-side enforcement. Accepted on values: `true` / `1` / `yes` / `on`. | unset |
 
 ## MiniMax Token Plan key
 
@@ -883,6 +887,51 @@ Do **not** open port 8789 to the public internet (no Tencent Cloud
 security group rule allowing `0.0.0.0/0 → 8789`, no firewall pinhole).
 Public access must come through a Phase O reverse proxy with HTTPS.
 Until that exists, leave 8789 bound to loopback only.
+
+### Disabling the in-app passcode behind Cloudflare Access (Phase Q)
+
+If the deployment is already protected upstream by Cloudflare Access
+(or any IdP-fronted reverse proxy that gates every request before it
+reaches the Node process), the in-app `SITE_PASSCODE` is a redundant
+second factor. Phase Q adds an opt-in switch to turn it off:
+
+```bash
+# in /home/ubuntu/apps/minimax-video-studio/.env on the CVM
+REQUIRE_SITE_PASSCODE=false
+CLOUDFLARE_ACCESS_EXPECTED=true
+systemctl --user restart minimax-video-studio.service
+```
+
+Effects of `REQUIRE_SITE_PASSCODE=false`:
+
+- The `/api/runtime-config` endpoint reports
+  `require_site_passcode: false` and the UI hides the `Passcode`
+  input box. It also shows an "Access is protected by Cloudflare
+  Access." banner so the operator knows where the access boundary
+  actually lives.
+- The middleware on `/api/tasks`, `/api/video/create`,
+  `/api/video/task/:id`, `/api/video/file/:id`, and
+  `/api/video/file/:id/refresh` is **skipped entirely**; requests
+  no longer need a `passcode` query / body / header.
+- `/api/health` and `/api/runtime-config` are unaffected by this
+  switch (they were never gated).
+- `SITE_PASSCODE` is still parsed from the environment (so it can
+  be rotated without a redeploy), but it is **not enforced**.
+
+Prerequisites for turning this off (do not skip any of them):
+
+- Node must bind on `127.0.0.1` only (the default since
+  `v0.2.2-alpha`); do NOT set `HOST=0.0.0.0`.
+- The public hostname must be fronted by Cloudflare Access
+  (or an equivalent IdP-fronted reverse proxy).
+- Port 8789 must NOT be reachable from the public internet (no
+  security-group pinhole, no firewall rule). The only public path
+  must be `Cloudflare → cloudflared tunnel → 127.0.0.1:8789`.
+- `MINIMAX_API_KEY` remains a deployment-side secret. The Phase Q
+  switch does not change the rule that the CVM holds the key.
+
+If any of those prerequisites is not true, leave
+`REQUIRE_SITE_PASSCODE=true` (the default).
 
 For the operator-facing, copy-pasteable Tencent Cloud CVM runbook — including
 `git clone`, `.env` creation, `npm install`, `npm run build`, `npm run start`,

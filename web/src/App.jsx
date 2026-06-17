@@ -403,6 +403,11 @@ export default function App() {
   const [modelConfig, setModelConfig] = useState(FALLBACK_MODEL_CONFIG);
   const [i2vConfig, setI2vConfig] = useState(FALLBACK_I2V_CONFIG);
   const [runtimeInfo, setRuntimeInfo] = useState(null); // { version, environment, service, ok } | null on pending; 'unknown' on failure
+  // runtimeConfig comes from /api/runtime-config. It controls whether
+  // the UI shows the SITE_PASSCODE input and whether API requests
+  // carry the passcode. It is intentionally distinct from runtimeInfo
+  // (which is just a deployment-label probe).
+  const [runtimeConfig, setRuntimeConfig] = useState(null);
   const [pollingConfig, setPollingConfig] = useState(FALLBACK_POLLING_CONFIG);
   const [passcode, setPasscode] = useState('');
   const [generationMode, setGenerationMode] = useState('text_to_video');
@@ -517,6 +522,41 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    async function loadRuntimeConfig() {
+      try {
+        const cfg = await requestJson('/api/runtime-config', { method: 'GET' }, false);
+        if (!cancelled) {
+          setRuntimeConfig({
+            require_site_passcode:
+              typeof cfg?.require_site_passcode === 'boolean'
+                ? cfg.require_site_passcode
+                : true,
+            cloudflare_access_expected:
+              typeof cfg?.cloudflare_access_expected === 'boolean'
+                ? cfg.cloudflare_access_expected
+                : false,
+            version: typeof cfg?.version === 'string' ? cfg.version : '',
+          });
+        }
+      } catch {
+        // Fail closed: keep passcode required by default.
+        if (!cancelled) {
+          setRuntimeConfig({
+            require_site_passcode: true,
+            cloudflare_access_expected: false,
+            version: '',
+          });
+        }
+      }
+    }
+    loadRuntimeConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!durations.includes(duration)) {
       setDuration(durations[0] || activeConfig.defaults.duration);
     }
@@ -529,17 +569,17 @@ export default function App() {
   }, [duration, durations, model, resolutions, resolution, activeConfig]);
 
   useEffect(() => {
-    if (!passcode) return;
+    if (!passcodeReady) return;
     loadTasks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [passcode, historyStatus, historySearch]);
+  }, [passcodeReady, historyStatus, historySearch]);
 
   useEffect(() => {
-    if (!passcode) return;
+    if (!passcodeReady) return;
     if (!currentTask && !selectedTask) return;
     loadTasks({ silent: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTask, currentTask]);
+  }, [selectedTask, currentTask, passcodeReady]);
 
   useEffect(() => {
     return () => {
@@ -621,15 +661,21 @@ export default function App() {
     const isGet = String(method).toUpperCase() === 'GET';
     const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
 
+    // When the server has REQUIRE_SITE_PASSCODE=false we should
+    // not send the passcode at all. The server will reject any
+    // mismatching SITE_PASSCODE in the query string with a 401, and
+    // sending an empty passcode is harmless but pointless.
+    const sendPasscode = includePasscode && passcodeRequired;
+
     let body = options.body;
-    if (includePasscode && !isGet) {
+    if (sendPasscode && !isGet) {
       const payload = body ? JSON.parse(body) : {};
       payload.passcode = passcode;
       body = JSON.stringify(payload);
     }
 
     const url = isGet
-      ? buildQueryString(path, includePasscode ? { passcode } : {})
+      ? buildQueryString(path, sendPasscode ? { passcode } : {})
       : path;
 
     const response = await fetch(url, {
@@ -655,7 +701,7 @@ export default function App() {
   }
 
   async function loadTasks({ offset = 0, silent = false } = {}) {
-    if (!passcode) return;
+    if (!passcodeReady) return;
     if (!silent) setHistoryLoading(true);
     setHistoryNotice('');
     try {
@@ -851,7 +897,7 @@ export default function App() {
     setMessage('');
     setInfo('');
 
-    if (!passcode.trim()) {
+    if (passcodeRequired && !passcode.trim()) {
       setError('Please enter SITE_PASSCODE before submitting.');
       return;
     }
@@ -1050,6 +1096,16 @@ export default function App() {
   }
 
   const showLoadingMessage = loading ? 'Submitting...' : 'Submit task';
+  // Whether the in-app SITE_PASSCODE is required by the server.
+  // We default to "required" (true) until /api/runtime-config tells
+  // us otherwise; the server is also the source of truth.
+  const passcodeRequired =
+    !runtimeConfig || runtimeConfig.require_site_passcode === true;
+  const accessProtected =
+    runtimeConfig && runtimeConfig.cloudflare_access_expected === true;
+  // A request may proceed if passcode is not required OR a passcode
+  // is present.
+  const passcodeReady = !passcodeRequired || Boolean(passcode && passcode.trim());
   const terminalStatus = selectedTask ? normalizeStatus(selectedTask.status) : null;
   const hasFileId = Boolean(selectedTask?.file_id);
   const hasDownloadUrl = Boolean(selectedTask?.download_url);
@@ -1062,7 +1118,8 @@ export default function App() {
         <p>
           T2V and I2V verified · {runtimeInfo && runtimeInfo !== 'unknown' && runtimeInfo.version
             ? runtimeInfo.version
-            : 'v0.2.2-alpha'} · Cloudflare Access protected
+            : 'v0.2.2-alpha'}
+          {accessProtected ? ' · Cloudflare Access protected' : ''}
         </p>
         <p className="runtime-line">
           Runtime:{' '}
@@ -1077,16 +1134,27 @@ export default function App() {
         </p>
       </header>
 
-      <section className="card">
-        <h2>Passcode</h2>
-        <input
-          className="input"
-          placeholder="SITE_PASSCODE"
-          value={passcode}
-          type="password"
-          onChange={(e) => setPasscode(e.target.value)}
-        />
-      </section>
+      {passcodeRequired ? (
+        <section className="card">
+          <h2>Passcode</h2>
+          <input
+            className="input"
+            placeholder="SITE_PASSCODE"
+            value={passcode}
+            type="password"
+            onChange={(e) => setPasscode(e.target.value)}
+          />
+          <p className="hint">This deployment requires an in-app passcode.</p>
+        </section>
+      ) : (
+        <section className="card access-banner">
+          <p>
+            <strong>Access is protected by Cloudflare Access.</strong>{' '}
+            You reached this page through the Access login flow; no
+            additional in-app passcode is required.
+          </p>
+        </section>
+      )}
 
       <form className="card" onSubmit={onSubmit}>
         <h2>Create task</h2>

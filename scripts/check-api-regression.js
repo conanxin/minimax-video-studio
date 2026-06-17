@@ -57,26 +57,6 @@ function recordResult(name, ok, detail) {
   logLine(`  [${tag}] ${name}${detail ? ` - ${detail}` : ''}`);
 }
 
-function assertNoKeyLeakage(payload, label) {
-  const text = JSON.stringify(payload || {});
-  // A literal value or full Bearer token. The string
-  // "MINIMAX_API_KEY" by itself (as a config name) is NOT a
-  // leak; only an actual key value or JWT-style token is.
-  const looksLikeValue = (s) => /^[A-Za-z0-9_-]{20,}$/.test(s);
-  const hasKeyValue = text
-    .split(/[",{}\s]+/)
-    .filter((tok) => tok && tok !== 'MINIMAX_API_KEY')
-    .some((tok) => looksLikeValue(tok) && /eyJ/i.test(tok));
-  const hasJwt = /eyJ[A-Za-z0-9_-]{20,}/.test(text);
-  const hasEnvAssignment = /MINIMAX_API_KEY\s*[:=]\s*['"]?[A-Za-z0-9_-]{16,}['"]?/.test(text);
-  if (hasKeyValue || hasJwt || hasEnvAssignment) {
-    recordResult(`${label}: no key leak`, false, 'response body contained a key fragment');
-    return false;
-  }
-  recordResult(`${label}: no key leak`, true, 'no key fragment detected');
-  return true;
-}
-
 function assertNoDownloadUrlLeak(payload, label) {
   // Phase L: structurally distinguish a legitimate `download_url` field
   // value from a real leak. The previous regex flagged any 16+ char
@@ -536,6 +516,27 @@ function assertNoKeyLeakage(payload, label) {
   return true;
 }
 
+function assertNoPasscodeLeakage(payload, label) {
+  const text = JSON.stringify(payload || {});
+  // The server should never echo the literal SITE_PASSCODE value
+  // (or the well-known default "change_me") through any public
+  // endpoint. We check both the configured value and the default.
+  const literals = [SITE_PASSCODE, 'change_me'].filter(
+    (s) => typeof s === 'string' && s.length >= 1,
+  );
+  const hit = literals.find((s) => text.includes(s));
+  if (hit) {
+    recordResult(
+      `${label}: no passcode leak`,
+      false,
+      `response body contained a literal passcode fragment (length=${hit.length})`,
+    );
+    return false;
+  }
+  recordResult(`${label}: no passcode leak`, true, 'no passcode fragment detected');
+  return true;
+}
+
 async function runChecks() {
   const base = `http://127.0.0.1:${PORT}`;
 
@@ -548,6 +549,26 @@ async function runChecks() {
     assertNoKeyLeakage(body, 'GET /api/health');
   } catch (err) {
     recordResult('GET /api/health returns 200', false, err.message);
+  }
+
+  // 1b. GET /api/runtime-config -> 200, public, no secret leakage
+  try {
+    const r = await fetch(`${base}/api/runtime-config`);
+    const body = await r.json().catch(() => ({}));
+    const okShape =
+      r.status === 200
+      && typeof body.require_site_passcode === 'boolean'
+      && typeof body.cloudflare_access_expected === 'boolean'
+      && typeof body.version === 'string';
+    recordResult(
+      'GET /api/runtime-config shape ok (boolean flags, version string)',
+      okShape,
+      `status=${r.status} shape=${JSON.stringify(body).slice(0, 120)}`,
+    );
+    assertNoKeyLeakage(body, 'GET /api/runtime-config');
+    assertNoPasscodeLeakage(body, 'GET /api/runtime-config');
+  } catch (err) {
+    recordResult('GET /api/runtime-config shape ok', false, err.message);
   }
 
   // 2. GET /api/tasks without passcode -> 401
@@ -1630,6 +1651,95 @@ async function main() {
     await runChecks();
   } finally {
     stopServer();
+  }
+
+  // Optional Phase Q passcode-off mode: opt in by setting
+  // TEST_NO_PASSCODE=1. Spawns a sibling server with
+  // REQUIRE_SITE_PASSCODE=false and asserts the access path no
+  // longer requires passcode (and that /api/runtime-config
+  // correctly reflects the new mode).
+  if (process.env.TEST_NO_PASSCODE === '1') {
+    try {
+      const priorPort = PORT;
+      const noPassPort = priorPort + 1;
+      const priorProc = serverProcess;
+      serverProcess = null;
+      // Spawn a sibling server with REQUIRE_SITE_PASSCODE=false
+      // and the helper env that disables access guards so we can
+      // exercise the open paths.
+      serverProcess = spawn(process.execPath, [path.resolve(ROOT, 'server', 'index.js')], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          PORT: String(noPassPort),
+          NODE_ENV: 'test',
+          REQUIRE_SITE_PASSCODE: 'false',
+          CLOUDFLARE_ACCESS_EXPECTED: 'true',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      serverProcess.stdout.on('data', (chunk) => { serverStdout += chunk.toString(); });
+      serverProcess.stderr.on('data', (chunk) => { serverStderr += chunk.toString(); });
+      serverProcess.on('error', (err) => { logLine(`[phase-i] sibling server error: ${err.message}`); });
+      const siblingReady = await waitForHealth(`http://127.0.0.1:${noPassPort}/api/health`);
+      if (!siblingReady) throw new Error('sibling server did not become healthy in time');
+
+      const siblingBase = `http://127.0.0.1:${noPassPort}`;
+      // S1: /api/runtime-config reflects the disabled state
+      try {
+        const r = await fetch(`${siblingBase}/api/runtime-config`);
+        const body = await r.json().catch(() => ({}));
+        recordResult(
+          'Phase Q /api/runtime-config require_site_passcode=false when set',
+          r.status === 200 && body.require_site_passcode === false,
+          `status=${r.status} body=${JSON.stringify(body).slice(0, 120)}`,
+        );
+        assertNoKeyLeakage(body, 'Phase Q /api/runtime-config');
+        assertNoPasscodeLeakage(body, 'Phase Q /api/runtime-config');
+      } catch (err) {
+        recordResult('Phase Q /api/runtime-config require_site_passcode=false', false, err.message);
+      }
+      // S2: GET /api/tasks without passcode -> 200
+      try {
+        const r = await fetch(`${siblingBase}/api/tasks`);
+        const body = await r.json().catch(() => ({}));
+        recordResult(
+          'Phase Q GET /api/tasks without passcode -> 200 when disabled',
+          r.status === 200,
+          `status=${r.status}`,
+        );
+        assertNoKeyLeakage(body, 'Phase Q GET /api/tasks (passcode off)');
+        assertNoDownloadUrlLeak(body, 'Phase Q GET /api/tasks (passcode off)');
+      } catch (err) {
+        recordResult('Phase Q GET /api/tasks without passcode -> 200', false, err.message);
+      }
+      // S3: POST /api/video/create without passcode -> 400 (validation), not 401
+      try {
+        const r = await fetch(`${siblingBase}/api/video/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: 'Phase Q access-tier smoke',
+            model: 'MiniMax-Hailuo-2.3',
+            duration: 6,
+            resolution: '4K', // invalid on purpose
+            prompt_optimizer: true,
+          }),
+        });
+        recordResult(
+          'Phase Q POST /api/video/create without passcode -> 400 (validation, not 401)',
+          r.status === 400,
+          `status=${r.status}`,
+        );
+      } catch (err) {
+        recordResult('Phase Q POST /api/video/create without passcode -> 400', false, err.message);
+      }
+    } catch (err) {
+      logLine(`[phase-i] Phase Q passcode-off mode error: ${err.message}`);
+    } finally {
+      try { if (serverProcess && !serverProcess.killed) serverProcess.kill('SIGTERM'); } catch (_) { /* ignore */ }
+      serverProcess = null;
+    }
   }
 
   const passed = checks.filter((c) => c.ok).length;

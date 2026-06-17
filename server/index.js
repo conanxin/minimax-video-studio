@@ -41,6 +41,24 @@ const PORT = Number(process.env.PORT) || 8789;
 // direct LAN exposure.
 const HOST = process.env.HOST || '127.0.0.1';
 const SITE_PASSCODE = String(process.env.SITE_PASSCODE || 'change_me').trim();
+// REQUIRE_SITE_PASSCODE lets an operator disable the in-app
+// passcode check entirely. This is intended for deployments that
+// are already protected upstream by Cloudflare Access (or an
+// equivalent IdP-fronted reverse proxy). The default is `true`
+// so an out-of-the-box open-source deployment is still gated by
+// the SITE_PASSCODE middleware. Accepted truthy values for
+// "disabled" are the lowercase strings: false / 0 / no / off.
+const REQUIRE_SITE_PASSCODE = !/^(false|0|no|off)$/i.test(
+  String(process.env.REQUIRE_SITE_PASSCODE || '').trim(),
+);
+// CLOUDFLARE_ACCESS_EXPECTED is a hint surfaced through
+// /api/runtime-config so the UI can display a banner explaining
+// where the access boundary actually lives. It does not change
+// any server-side enforcement.
+const CLOUDFLARE_ACCESS_EXPECTED =
+  /^(true|1|yes|on)$/i.test(
+    String(process.env.CLOUDFLARE_ACCESS_EXPECTED || '').trim(),
+  );
 // APP_VERSION lets the operator pin a deployment label (e.g. the
 // git tag). Falls back to package.json version when unset.
 const APP_VERSION =
@@ -69,6 +87,18 @@ app.get('/api/health', async (_req, res) => {
     ok: true,
     service: 'minimax-video-studio',
     environment: process.env.NODE_ENV || 'development',
+    version: APP_VERSION,
+  });
+});
+
+// Public, unauthenticated runtime configuration. This endpoint is
+// intentionally NOT gated by requirePasscode so the UI can fetch it
+// before the user has decided whether to authenticate. It must
+// never echo SITE_PASSCODE, MINIMAX_API_KEY, or any other secret.
+app.get('/api/runtime-config', (_req, res) => {
+  res.json({
+    require_site_passcode: REQUIRE_SITE_PASSCODE,
+    cloudflare_access_expected: CLOUDFLARE_ACCESS_EXPECTED,
     version: APP_VERSION,
   });
 });
@@ -125,6 +155,7 @@ function getPasscode(req) {
 }
 
 function requirePasscode(req, res, next) {
+  if (!REQUIRE_SITE_PASSCODE) return next();
   const passcode = getPasscode(req);
   if (!passcode || String(passcode).trim() !== SITE_PASSCODE) {
     return res.status(401).json({ error: 'Passcode check failed. Please provide the correct SITE_PASSCODE.' });
